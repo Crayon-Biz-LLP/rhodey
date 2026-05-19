@@ -1,0 +1,59 @@
+name: 🧠 Knowledge Synthesis Sweep
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # Runs every night at 7:30 AM IST (02:00 UTC)
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_ROLE_KEY" ] || [ -z "$GEMINI_API_KEY" ]; then
+            echo "❌ One or more required secrets are missing or empty"
+            exit 1
+          fi
+          echo "✅ All secrets present"
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            supabase \
+            google-genai \
+            google-api-python-client \
+            google-auth-httplib2 \
+            google-auth-oauthlib \
+            python-dotenv
+
+      - name: Run Historian Sweep
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python -m core.skills.brain_synth
+
+  notify_failure:
+    runs-on: ubuntu-latest
+    needs: sweep
+    if: failure()
+    steps:
+      - name: Notify on failure
+        run: |
+          echo "⚠️ Knowledge Synthesis Sweep FAILED at $(date)"
+          echo "Check logs: https://github.com/Crayon-Biz-LLP/integrated-os/actions"
