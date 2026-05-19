@@ -11,22 +11,20 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from core.lib.audit_logger import audit_log_sync
-from core.services.db import get_supabase
-
-supabase = get_supabase()
+from core.services.db import user_query, get_supabase
 
 
 def cleanup_orphan_graph_edges(dry_run: bool = False):
     audit_log_sync("cleanup_orphans", "INFO", "Starting orphan graph edge cleanup...")
-    all_edges = supabase.table("graph_edges").select("id, source_id, target_id").execute()
+    all_edges = user_query("graph_edges").select("id, source_id, target_id").execute()
     orphans = 0
     for edge in all_edges.data or []:
-        src = supabase.table("graph_nodes").select("id").eq("id", edge["source_id"]).execute()
-        tgt = supabase.table("graph_nodes").select("id").eq("id", edge["target_id"]).execute()
+        src = user_query("graph_nodes").select("id").eq("id", edge["source_id"]).execute()
+        tgt = user_query("graph_nodes").select("id").eq("id", edge["target_id"]).execute()
         if not src.data or not tgt.data:
             orphans += 1
             if not dry_run:
-                supabase.table("graph_edges").delete().eq("id", edge["id"]).execute()
+                user_query("graph_edges").delete().eq("id", edge["id"]).execute()
                 audit_log_sync("cleanup_orphans", "INFO", f"Deleted orphan edge {edge['id']}")
     if orphans:
         msg = f"Deleted {orphans} orphan graph edges."
@@ -38,17 +36,17 @@ def cleanup_orphan_graph_edges(dry_run: bool = False):
 
 def cleanup_orphan_tasks(dry_run: bool = False):
     audit_log_sync("cleanup_orphans", "INFO", "Starting orphan task cleanup...")
-    all_tasks = supabase.table("tasks").select("id, project_id, title").execute()
+    all_tasks = user_query("tasks").select("id, project_id, title").execute()
     orphans = 0
     for task in all_tasks.data or []:
         pid = task.get("project_id")
         if not pid:
             continue
-        proj = supabase.table("projects").select("id").eq("id", pid).execute()
+        proj = user_query("projects").select("id").eq("id", pid).execute()
         if not proj.data:
             orphans += 1
             if not dry_run:
-                supabase.table("tasks").update({
+                user_query("tasks").update({
                     "project_id": None,
                     "is_current": True
                 }).eq("id", task["id"]).execute()
@@ -64,18 +62,18 @@ def cleanup_orphan_tasks(dry_run: bool = False):
 
 def cleanup_orphan_memories(dry_run: bool = False):
     audit_log_sync("cleanup_orphans", "INFO", "Starting orphan memory cleanup...")
-    all_mems = supabase.table("memories").select("id, people_ids, project_ids").execute()
+    all_mems = user_query("memories").select("id, people_ids, project_ids").execute()
     orphans = 0
     for mem in all_mems.data or []:
         pids = mem.get("people_ids")
         if pids and isinstance(pids, list):
             for pid in pids:
-                person = supabase.table("people").select("id").eq("id", pid).execute()
+                person = user_query("people").select("id").eq("id", pid).execute()
                 if not person.data:
                     orphans += 1
                     if not dry_run:
                         new_pids = [p for p in pids if p != pid]
-                        supabase.table("memories").update({"people_ids": new_pids}).eq("id", mem["id"]).execute()
+                        user_query("memories").update({"people_ids": new_pids}).eq("id", mem["id"]).execute()
                         audit_log_sync("cleanup_orphans", "INFO",
                                       f"Removed missing person {pid} from memory {mem['id']}")
     if orphans:
@@ -88,13 +86,13 @@ def cleanup_orphan_memories(dry_run: bool = False):
 
 def cleanup_orphan_raw_dumps(dry_run: bool = False):
     audit_log_sync("cleanup_orphans", "INFO", "Starting orphan raw_dumps cleanup...")
-    before = supabase.table("raw_dumps").select("id", count="exact").neq("status", "completed").execute()
+    before = user_query("raw_dumps").select("id", count="exact").neq("status", "completed").execute()
     count_before = before.count or 0
     if count_before == 0:
         print("  No raw_dumps to clean.")
         return
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    stale = supabase.table("raw_dumps") \
+    stale = user_query("raw_dumps") \
         .select("id", count="exact") \
         .neq("status", "completed") \
         .lt("created_at", cutoff) \
@@ -104,7 +102,7 @@ def cleanup_orphan_raw_dumps(dry_run: bool = False):
         print("  No stale raw_dumps found.")
         return
     if not dry_run:
-        supabase.table("raw_dumps") \
+        user_query("raw_dumps") \
             .update({"status": "completed", "is_processed": True}) \
             .neq("status", "completed") \
             .lt("created_at", cutoff) \

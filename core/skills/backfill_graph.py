@@ -9,12 +9,9 @@ from supabase import create_client
 from core.lib.rate_limiter import flash_lite_limiter
 from core.lib.people_utils import normalize_person_name, is_blocklisted_person
 from core.lib.audit_logger import info, warning, error, audit_log_sync
-from core.services.db import get_supabase
+from core.services.db import user_query, user_insert, get_supabase
 from core.services.pipeline_service import add_to_failed_queue
 from core.services.llm import get_gemini_client, call_llm_with_fallback as _service_call_llm
-
-supabase = get_supabase()
-gemini_client = get_gemini_client()
 
 # OpenRouter config
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -42,6 +39,7 @@ def call_llm_with_fallback_sync(
     2. Fallback: Gemma (gemma-4-31b-it)
     3. Fallback: OpenRouter (nvidia/nemotron-3-super-120b-a12b:free)
     """
+    gemini_client = get_gemini_client()
     if model is None:
         model = "gemini-3.1-flash-lite-preview"
     
@@ -193,7 +191,7 @@ def fetch_all_paginated(table_name: str, select_str: str = "*", in_filter_col=No
     start = 0
     page_size = 1000
     while True:
-        query = supabase.table(table_name).select(select_str)
+        query = user_query(table_name).select(select_str)
         if in_filter_col and in_filter_val:
             query = query.in_(in_filter_col, in_filter_val)
         
@@ -324,6 +322,7 @@ def gemini_with_retry_sync(prompt: str, model: str, config: dict = None, retries
 
 def get_embedding(text: str) -> list | None:
     """Generate a 768-dim embedding via Gemini for a given text string."""
+    gemini_client = get_gemini_client()
     if not text or not text.strip():
         return None
     try:
@@ -359,7 +358,7 @@ def backfill_embeddings():
     while True:
         try:
             res = with_retry(
-                lambda: supabase.table("memories")
+                lambda: user_query("memories")
                     .select("id, content, memory_type, metadata")
                     .in_("memory_type", MEMORY_TYPES)
                     .is_("embedding", "null")
@@ -405,7 +404,7 @@ def backfill_embeddings():
 
         try:
             with_retry(
-                lambda: supabase.table("memories")
+                lambda: user_query("memories")
                     .update({"embedding": embedding, "embedding_status": "success"})
                     .eq("id", memory_id)
                     .execute(),
@@ -416,7 +415,7 @@ def backfill_embeddings():
         except Exception as e:
             # Mark as failed
             try:
-                supabase.table("memories").update({"embedding_status": "failed"}).eq("id", memory_id).execute()
+                user_query("memories").update({"embedding_status": "failed"}).eq("id", memory_id).execute()
             except:
                 pass
             
@@ -447,7 +446,7 @@ def backfill_embeddings():
 # ── END EMBEDDING BACKFILL ──────────────────────────────────────────────────
 
 
-def extract_graph_elements(text: str, memory_id: str) -> dict:
+def extract_graph_elements(text: str, memory_id: str, owner_name: str = "User") -> dict:
     prompt = f"""Extract knowledge graph elements from this text.
     
 Return a JSON object with:
@@ -460,7 +459,7 @@ Rules:
 - Extract People (names), Organizations, Projects, Emotional States, Concepts as nodes
 - Create edges for relationships between nodes
 - Use UPPERCASE relationship types: "RELATES_TO", "PARENT_OF", "WORKS_AT", "BELONGS_TO", "AUTHORED", "INTRODUCED", "VENDOR_TO", "DISCUSSED_WITH"
-- Include "AUTHORED" edge from "Danny" to indicate he wrote this memory
+- Include "AUTHORED" edge from "{owner_name}" to indicate they authored this memory
 - If no clear graph elements, return empty arrays
 - CRITICAL: Do NOT extract anything from URLs, file paths, or online handles. Ignore path segments in links like "github.com/username" or "bit.ly/handle". Only extract entities that appear as clear person names, organization names, or project names in natural language text."""
     
@@ -503,7 +502,7 @@ def get_or_create_node(label: str, node_type: str, graph_entities: dict, created
         existing_type = graph_entities[label].get("type", "concept")
         if existing_type != node_type:
             try:
-                supabase.table("graph_nodes").update({"type": node_type}).eq("id", node_id).execute()
+                user_query("graph_nodes").update({"type": node_type}).eq("id", node_id).execute()
                 graph_entities[label]["type"] = node_type
                 audit_log_sync("backfill_graph", "INFO", 
                     f"Updated node '{label}' type: {existing_type} → {node_type}")
@@ -514,7 +513,7 @@ def get_or_create_node(label: str, node_type: str, graph_entities: dict, created
     
     # Node doesn't exist - create it
     try:
-        result = supabase.table("graph_nodes").upsert(
+        result = user_query("graph_nodes").upsert(
             {"label": label, "type": node_type, "metadata": json.dumps({"source": "backfill_graph", "memory_id": memory_id})},
             on_conflict="label"
         ).execute()
@@ -523,7 +522,7 @@ def get_or_create_node(label: str, node_type: str, graph_entities: dict, created
             node_id = result.data[0]["id"]
         else:
             # Fetch the created/updated node
-            res = supabase.table("graph_nodes") \
+            res = user_query("graph_nodes") \
                 .select("id") \
                 .eq("label", label) \
                 .single() \
@@ -569,7 +568,7 @@ def upsert_nodes(nodes: list, graph_entities: dict, memory_id: str):
     
     if node_records:
         try:
-            supabase.table("graph_nodes").upsert(
+            user_query("graph_nodes").upsert(
                 node_records,
                 on_conflict="label"
             ).execute()
@@ -602,8 +601,8 @@ def insert_edges(edges: list, node_label_to_id: dict, memory_id: str):
         
         # Additional validation: Check if nodes actually exist in DB
         try:
-            source_check = supabase.table("graph_nodes").select("id").eq("id", source_id).execute()
-            target_check = supabase.table("graph_nodes").select("id").eq("id", target_id).execute()
+            source_check = user_query("graph_nodes").select("id").eq("id", source_id).execute()
+            target_check = user_query("graph_nodes").select("id").eq("id", target_id).execute()
             
             if not source_check.data or not target_check.data:
                 audit_log_sync("backfill_graph", "WARNING", 
@@ -615,7 +614,7 @@ def insert_edges(edges: list, node_label_to_id: dict, memory_id: str):
             continue
             
         try:
-            supabase.table("graph_edges").upsert({
+            user_query("graph_edges").upsert({
                 "source_node_id": source_id,
                 "target_node_id": target_id,
                 "relationship": relationship,
@@ -626,14 +625,14 @@ def insert_edges(edges: list, node_label_to_id: dict, memory_id: str):
             continue
 
 
-def process_memory(memory: dict, graph_entities: dict) -> bool:
+def process_memory(memory: dict, graph_entities: dict, owner_name: str = "User") -> bool:
     memory_id = memory["id"]
     synthesized = synthesize_content(memory)
     
     if not synthesized.strip():
         return False
     
-    graph_data = extract_graph_elements(synthesized, memory_id)
+    graph_data = extract_graph_elements(synthesized, memory_id, owner_name)
     
     nodes = graph_data.get("nodes", [])
     edges = graph_data.get("edges", [])
@@ -657,9 +656,9 @@ def process_memory(memory: dict, graph_entities: dict) -> bool:
             node_label_to_id[label] = node_id
     
     if not node_label_to_id:
-        danny_id = get_or_create_node("Danny", "person", graph_entities, created_nodes, memory_id)
-        if danny_id:
-            node_label_to_id["Danny"] = danny_id
+        owner_id = get_or_create_node(owner_name, "person", graph_entities, created_nodes, memory_id)
+        if owner_id:
+            node_label_to_id[owner_name] = owner_id
     
     insert_edges(edges, node_label_to_id, memory_id)
     
@@ -667,6 +666,21 @@ def process_memory(memory: dict, graph_entities: dict) -> bool:
 
 
 def run_backfill():
+    # ── Step 0: Fetch owner name from user_profiles ─────────────────────────
+    owner_name = "User"
+    try:
+        res = get_supabase().table('user_profiles')\
+            .select('owner_name')\
+            .eq('approval_status', 'approved')\
+            .limit(1)\
+            .maybe_single()\
+            .execute()
+        if res.data:
+            owner_name = res.data.get('owner_name', 'User')
+    except Exception:
+        pass
+    print(f"Owner: {owner_name}")
+
     # ── Step 1: Patch missing embeddings first ──────────────────────────────
     backfill_embeddings()
 
@@ -689,7 +703,7 @@ def run_backfill():
         
         for idx, memory in enumerate(batch):
             try:
-                success = process_memory(memory, graph_entities)
+                success = process_memory(memory, graph_entities, owner_name)
                 if success:
                     processed += 1
                 else:
@@ -769,12 +783,12 @@ def backfill_orphaned_tasks():
             meta["project_id"] = project_id
         
         try:
-            supabase.table("graph_nodes").upsert({
+            user_query("graph_nodes").upsert({
                 "label": task_title,
                 "type": "task",
                 "metadata": json.dumps({"source": "tasks_table", "task_id": task_id, **meta})
             }, on_conflict="label").execute()
-            node_res = supabase.table("graph_nodes").select("id").eq("label", task_title).maybe_single().execute()
+            node_res = user_query("graph_nodes").select("id").eq("label", task_title).maybe_single().execute()
             if not node_res or not node_res.data:
                 audit_log_sync("backfill_graph", "WARNING", f"⚠️ Failed to get node for task {task_id}")
                 continue
@@ -787,7 +801,7 @@ def backfill_orphaned_tasks():
             proj_node = None
             # Try metadata->>legacy_id first (new style)
             try:
-                proj_node = supabase.table("graph_nodes") \
+                proj_node = user_query("graph_nodes") \
                     .select("id") \
                     .eq("type", "project") \
                     .filter("metadata->>legacy_id", "eq", str(project_id)) \
@@ -798,7 +812,7 @@ def backfill_orphaned_tasks():
             # Try metadata->>project_id (old style)
             if proj_node is None or proj_node.data is None:
                 try:
-                    proj_node = supabase.table("graph_nodes") \
+                    proj_node = user_query("graph_nodes") \
                         .select("id") \
                         .eq("type", "project") \
                         .filter("metadata->>project_id", "eq", str(project_id)) \
@@ -810,7 +824,7 @@ def backfill_orphaned_tasks():
             if (proj_node is None or proj_node.data is None) and project_id in project_id_to_name:
                 proj_name = project_id_to_name[project_id]
                 try:
-                    proj_node = supabase.table("graph_nodes") \
+                    proj_node = user_query("graph_nodes") \
                         .select("id") \
                         .eq("type", "project") \
                         .ilike("label", proj_name) \
@@ -822,7 +836,7 @@ def backfill_orphaned_tasks():
             if proj_node is not None and proj_node.data is not None:
                 proj_node_id = proj_node.data["id"]
                 try:
-                    existing = supabase.table("graph_edges") \
+                    existing = user_query("graph_edges") \
                         .select("id") \
                         .eq("source_node_id", task_node_id) \
                         .eq("target_node_id", proj_node_id) \
@@ -831,7 +845,7 @@ def backfill_orphaned_tasks():
                         .execute()
                     
                     if existing is None or not existing.data:
-                        supabase.table("graph_edges").insert({
+                        user_insert("graph_edges", {
                             "source_node_id": task_node_id,
                             "target_node_id": proj_node_id,
                             "relationship": "BELONGS_TO",
@@ -848,7 +862,7 @@ def backfill_orphaned_tasks():
                 # Try metadata->>people_id first (new style)
                 person_node = None
                 try:
-                    person_node = supabase.table("graph_nodes") \
+                    person_node = user_query("graph_nodes") \
                         .select("id") \
                         .eq("type", "person") \
                         .filter("metadata->>people_id", "eq", str(pid)) \
@@ -859,7 +873,7 @@ def backfill_orphaned_tasks():
                 # Fallback: label-based match
                 if person_node is None or person_node.data is None:
                     try:
-                        person_node = supabase.table("graph_nodes") \
+                        person_node = user_query("graph_nodes") \
                             .select("id") \
                             .eq("type", "person") \
                             .ilike("label", pname) \
@@ -871,7 +885,7 @@ def backfill_orphaned_tasks():
                 if person_node and person_node.data:
                     person_node_id = person_node.data["id"]
                     try:
-                        existing_edge = supabase.table("graph_edges") \
+                        existing_edge = user_query("graph_edges") \
                             .select("id") \
                             .eq("source_node_id", task_node_id) \
                             .eq("target_node_id", person_node_id) \
@@ -880,7 +894,7 @@ def backfill_orphaned_tasks():
                             .execute()
                         
                         if not existing_edge or not existing_edge.data:
-                            supabase.table("graph_edges").insert({
+                            user_insert("graph_edges", {
                                 "source_node_id": task_node_id,
                                 "target_node_id": person_node_id,
                                 "relationship": "INVOLVES",
@@ -936,7 +950,7 @@ def sync_project_nodes_to_projects_table():
         if legacy_id:
             meta["legacy_id"] = legacy_id
             try:
-                supabase.table("graph_nodes").update({"metadata": json.dumps(meta)}).eq("id", n["id"]).execute()
+                user_query("graph_nodes").update({"metadata": json.dumps(meta)}).eq("id", n["id"]).execute()
                 synced += 1
             except Exception as e:
                 audit_log_sync("backfill_graph", "WARNING", f"Failed to sync project node {n['id']}: {e}")
@@ -985,7 +999,7 @@ def sync_person_nodes_to_people_table():
             meta["people_id"] = matched_id
         else:
             try:
-                result = supabase.table("people").insert({
+                result = user_insert("people", {
                     "name": n["label"].strip(),
                     "source": "backfill_graph"
                 }).execute()
@@ -1001,7 +1015,7 @@ def sync_person_nodes_to_people_table():
                 audit_log_sync("backfill_graph", "WARNING", f"Failed to create person '{n['label']}': {e}")
                 continue
         try:
-            supabase.table("graph_nodes").update({"metadata": json.dumps(meta)}).eq("id", n["id"]).execute()
+            user_query("graph_nodes").update({"metadata": json.dumps(meta)}).eq("id", n["id"]).execute()
             synced += 1
         except Exception as e:
             audit_log_sync("backfill_graph", "WARNING", f"Failed to update person node {n['id']}: {e}")

@@ -1,15 +1,10 @@
 import os
 import asyncio
 from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
 from core.lib.audit_logger import audit_log_sync
-from core.services.db import versioned_update
+from core.lib.prompt_template import render_prompt
+from core.services.db import get_supabase, user_query, user_insert, versioned_update
 from core.pulse.llm import call_llm_with_fallback, get_embedding
-
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
 
 
 async def write_outcome_memory(task_title: str, project_name: str = None):
@@ -24,7 +19,7 @@ async def write_outcome_memory(task_title: str, project_name: str = None):
 
         embedding = await asyncio.to_thread(get_embedding, label)
         status = 'success' if embedding and any(embedding) else 'failed'
-        supabase.table('memories').insert({
+        user_insert('memories', {
             "content": label,
             "memory_type": "outcome",
             "embedding": embedding,
@@ -72,7 +67,7 @@ async def get_recent_memories_for_briefing(tasks: list, max_memories: int = 5) -
         from datetime import timedelta
         thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
 
-        memories_res = supabase.rpc('match_memories', {
+        memories_res = get_supabase().rpc('match_memories', {
             'query_embedding': query_embedding,
             'match_threshold': 0.7,
             'match_count': max_memories,
@@ -131,7 +126,7 @@ async def retrieve_hindsight_memories(task_inputs: list, active_tasks: list, top
             try:
                 embedding = await asyncio.to_thread(get_embedding, query_text)
                 if not any(embedding): return []
-                res = supabase.rpc(
+                res = get_supabase().rpc(
                     'match_memories',
                     {
                         'query_embedding': embedding,
@@ -175,15 +170,15 @@ async def generate_after_action_report() -> str:
         now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
-        completed_tasks_res = supabase.table('tasks').select('title').eq('status', 'done').gte('completed_at', today_start).execute()
+        completed_tasks_res = user_query('tasks').select('title').eq('status', 'done').gte('completed_at', today_start).execute()
         completed_count = len(completed_tasks_res.data) if completed_tasks_res.data else 0
 
-        open_tasks_res = supabase.table('tasks').select('id').eq('status', 'todo').eq('is_current', True).execute()
+        open_tasks_res = user_query('tasks').select('id').eq('status', 'todo').eq('is_current', True).execute()
         open_count = len(open_tasks_res.data) if open_tasks_res.data else 0
 
-        prompt = f"""You are Danny's Rhodey. Provide a dry After-Action Report (AAR). 1-2 sentences max. Focus on loops closed vs. open.
+        prompt = render_prompt(f"""You are {{owner_name}}'s Rhodey. Provide a dry After-Action Report (AAR). 1-2 sentences max. Focus on loops closed vs. open.
         - Loops closed today: {completed_count}
-        - Loops still open: {open_count}"""
+        - Loops still open: {open_count}""")
 
         response = await call_llm_with_fallback(
             prompt=prompt,
@@ -198,7 +193,7 @@ async def generate_after_action_report() -> str:
             status = 'success' if embedding and any(embedding) else 'failed'
             if status == 'failed':
                 audit_log_sync("pulse", "WARNING", f"Warning: zero-vector embedding for daily reflection — storing with failed status")
-            supabase.table('memories').insert({
+            user_insert('memories', {
                 "content": lesson,
                 "memory_type": "reflection",
                 "embedding": embedding,
@@ -223,7 +218,7 @@ async def detect_temporal_patterns() -> str:
         today_str = today.strftime("%B %d")
 
         # Search memories from same month/day in previous years
-        memories_res = supabase.table('memories') \
+        memories_res = user_query('memories') \
             .select('content, memory_type, created_at') \
             .or_(f"created_at::text.ilike.*{today.month:02}-{today.day:02}*") \
             .order('created_at', desc=True) \
@@ -323,7 +318,7 @@ async def adaptive_briefing_learner(briefing_history: list = None) -> str:
     """
     ADAPTIVE BRIEFING LEARNER: Learns from past briefings to improve future ones.
     Tracks which insights were useful, adjusts briefing style, and personalizes
-    the briefing based on Danny's interaction patterns.
+    the briefing based on {owner_name}'s interaction patterns.
     """
     try:
         # For now, implement basic pattern tracking
@@ -335,7 +330,7 @@ async def adaptive_briefing_learner(briefing_history: list = None) -> str:
         # Track which briefing modes (morning/afternoon/night) produce more actionable insights
         try:
             # Look at recent memories to see which time of day produced more reflections
-            recent_memories = supabase.table('memories') \
+            recent_memories = user_query('memories') \
                 .select('content, memory_type, created_at') \
                 .gte('created_at', (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()) \
                 .execute()
@@ -359,7 +354,7 @@ async def adaptive_briefing_learner(briefing_history: list = None) -> str:
         # 2. Section density learning
         # Track if certain sections are consistently empty and suggest hiding them
         try:
-            recent_tasks = supabase.table('tasks') \
+            recent_tasks = user_query('tasks') \
                 .select('org_tag, priority, status') \
                 .eq('status', 'active') \
                 .execute()

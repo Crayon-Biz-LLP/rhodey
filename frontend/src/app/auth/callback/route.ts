@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
 
-const AUTHORIZED_EMAIL = 'danielyashwant@gmail.com';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://integrated-os.vercel.app';
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
@@ -43,10 +43,39 @@ export async function GET(request: Request) {
     return NextResponse.redirect(new URL('/login?error=auth_failed', url.origin));
   }
 
-  if (user.email !== AUTHORIZED_EMAIL) {
-    await supabase.auth.signOut();
-    return NextResponse.redirect(new URL('/login?error=unauthorized', url.origin));
+  const session = await supabase.auth.getSession();
+  const token = session.data.session?.access_token;
+
+  try {
+    const registerRes = await fetch(`${API_BASE}/api/auth/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({ owner_name: user.email?.split('@')[0] || 'User' }),
+    });
+
+    if (registerRes.ok) {
+      const data = await registerRes.json();
+      if (data.approval_status === 'pending') {
+        return NextResponse.redirect(new URL('/pending-approval', url.origin));
+      }
+      if (data.approval_status === 'approved') {
+        const statusRes = await fetch(`${API_BASE}/api/auth/status`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (statusRes.ok) {
+          const status = await statusRes.json();
+          if (!status.onboarding_completed) {
+            return NextResponse.redirect(new URL('/onboarding', url.origin));
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Registration call failed:', e);
   }
 
-  return response;
+  return NextResponse.redirect(new URL('/dashboard/tasks', url.origin));
 }

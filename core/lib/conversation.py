@@ -1,25 +1,9 @@
-import os
 import uuid
 from datetime import datetime, timezone, timedelta
+from core.services.db import user_query, user_insert
 
 SESSION_TIMEOUT_MINUTES = 5
 MAX_HISTORY_TOKENS = 2000
-
-# Create supabase client with fallback (matching webhook.py import pattern)
-_supabase = None
-def _get_supabase():
-    global _supabase
-    if _supabase is None:
-        try:
-            from supabase import create_client, Client
-            _supabase = create_client(
-                os.getenv("SUPABASE_URL"),
-                os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-            )
-        except Exception as e:
-            print(f"conversation: supabase client init failed: {e}")
-            raise
-    return _supabase
 
 
 def _approx_tokens(text: str) -> int:
@@ -38,7 +22,7 @@ def get_or_create_session(chat_id: int) -> tuple:
     - No prior session exists (first ever message)
     - Last exchange was > SESSION_TIMEOUT_MINUTES ago
     """
-    res = _get_supabase().table('conversations') \
+    res = user_query('conversations') \
         .select('session_id, created_at') \
         .eq('chat_id', chat_id) \
         .order('created_at', desc=True) \
@@ -67,7 +51,7 @@ def get_history(session_id: str, max_tokens: int = MAX_HISTORY_TOKENS) -> list:
     Builds user+bot pairs, then drops oldest pairs from front until
     within max_tokens.
     """
-    res = _get_supabase().table('conversations') \
+    res = user_query('conversations') \
         .select('role, intent, content, token_count') \
         .eq('session_id', session_id) \
         .order('created_at') \
@@ -120,7 +104,7 @@ def log_exchange(session_id: str, role: str, intent: str, content: str, chat_id:
             "token_count": _approx_tokens(content),
             "metadata": metadata or {}
         }
-        _get_supabase().table('conversations').insert(record).execute()
+        user_insert('conversations', record).execute()
     except Exception as e:
         print(f"conversation.log_exchange error: {e}")
 

@@ -4,10 +4,9 @@ import os
 import httpx
 from datetime import datetime, timezone
 
-from core.services.db import get_supabase, get_embedding
+from core.services.db import user_query, user_insert, get_supabase, get_embedding
 from core.services.llm import call_gemini_with_retry
-
-supabase = get_supabase()
+from core.lib.prompt_template import render_prompt
 
 PARENT_ORG_TAGS = {'SOLVSTRAT', 'QHORD', 'ASHRAYA', 'PERSONAL', 'CRAYON'}
 SKIP_ORG_TAGS = {None, 'INBOX'}
@@ -15,7 +14,7 @@ MIN_FRAGMENT_THRESHOLD = 5
 
 ORG_TAG_CONTEXT = {
     'SOLVSTRAT': 'Client services and delivery. Software development, consulting, client projects.',
-    'QHORD': "Product GTM and launch. Qhord is Danny's standalone product launching June 2026.",
+    'QHORD': "Product GTM and launch. Qhord is {owner_name}'s standalone product launching June 2026.",
     'ASHRAYA': 'Ashraya church administration, operations, finances, events.',
     'PERSONAL': 'Family, home, health, personal admin, spiritual practices.',
     'CRAYON': 'Company governance, legal, tax, compliance, admin structure.',
@@ -39,7 +38,7 @@ def filter_fragments_by_project(results, project_name):
 
 async def run_batch_sweep():
     try:
-        active_res = supabase.table('projects') \
+        active_res = user_query('projects') \
             .select('id, name, org_tag') \
             .eq('is_active', True) \
             .eq('status', 'active') \
@@ -68,7 +67,7 @@ async def run_batch_sweep():
                 entity_embedding = get_embedding(entity_name)
 
                 if entity_embedding:
-                    mem = supabase.rpc('match_memories', {
+                    mem = get_supabase().rpc('match_memories', {
                         'query_embedding': entity_embedding,
                         'match_threshold': 0.5,
                         'match_count': 20
@@ -77,14 +76,14 @@ async def run_batch_sweep():
                         for f in filter_fragments_by_project(mem.data, entity_name):
                             add_fragment("MEMORY", f['content'])
 
-                tasks = supabase.table('tasks').select('title, status') \
+                tasks = user_query('tasks').select('title, status') \
                     .eq('project_id', project_id).execute()
                 if tasks.data:
                     for t in tasks.data:
                         add_fragment(f"TASK/{t['status'].upper()}", t['title'])
 
                 if entity_embedding:
-                    logs = supabase.rpc('match_logs', {
+                    logs = get_supabase().rpc('match_logs', {
                         'query_embedding': entity_embedding,
                         'match_threshold': 0.5,
                         'match_count': 20
@@ -94,7 +93,7 @@ async def run_batch_sweep():
                             add_fragment("LOG", f['content'])
 
                 if entity_embedding:
-                    resources = supabase.rpc('match_resources', {
+                    resources = get_supabase().rpc('match_resources', {
                         'query_embedding': entity_embedding,
                         'match_threshold': 0.5,
                         'match_count': 10
@@ -104,7 +103,7 @@ async def run_batch_sweep():
                             add_fragment("RESOURCE", f"{r['title']} — {r.get('summary', '')}")
 
                 if entity_embedding:
-                    dumps = supabase.rpc('match_raw_dumps', {
+                    dumps = get_supabase().rpc('match_raw_dumps', {
                         'query_embedding': entity_embedding,
                         'match_threshold': 0.5,
                         'match_count': 30
@@ -113,20 +112,20 @@ async def run_batch_sweep():
                         for d in filter_fragments_by_project(dumps.data, entity_name):
                             add_fragment("DUMP", d['content'])
 
-                people = supabase.table('people').select('name, role, strategic_weight') \
+                people = user_query('people').select('name, role, strategic_weight') \
                     .ilike('name', f'%{entity_name}%').execute()
                 if people.data:
                     for p in people.data:
                         add_fragment("PERSON", f"{p.get('name', 'Unknown')} — {p.get('role', 'Unknown role')}")
 
                 if org_tag in PARENT_ORG_TAGS:
-                    child_res = supabase.table('projects') \
+                    child_res = user_query('projects') \
                         .select('id, name') \
                         .eq('parent_project_id', project_id) \
                         .eq('status', 'active') \
                         .execute()
                     for child in child_res.data or []:
-                        child_tasks = supabase.table('tasks').select('title, status') \
+                        child_tasks = user_query('tasks').select('title, status') \
                             .eq('project_id', child['id']).execute()
                         for t in child_tasks.data or []:
                             add_fragment(f"CHILD_TASK/{t['status'].upper()}", f"[{child['name']}] {t['title']}")
@@ -137,7 +136,7 @@ async def run_batch_sweep():
 
             is_parent = org_tag in PARENT_ORG_TAGS and entity_name.lower() == org_tag.lower()
 
-            existing = supabase.table('canonical_pages') \
+            existing = get_supabase().table('canonical_pages') \
                 .select('id, content') \
                 .eq('project_id', project_id) \
                 .eq('is_current', True) \
@@ -157,7 +156,7 @@ async def run_batch_sweep():
                     "existing_id": existing_id
                 })
             elif existing_id:
-                supabase.table('canonical_pages') \
+                get_supabase().table('canonical_pages') \
                     .update({"is_current": False}) \
                     .eq('id', existing_id) \
                     .execute()
@@ -188,19 +187,19 @@ async def run_batch_sweep():
             org_context = ORG_TAG_CONTEXT.get(org_tag, org_tag)
 
             if is_parent:
-                prompt_role = "Executive Summary Writer for Danny's OS"
+                prompt_role = "Executive Summary Writer for {owner_name}'s OS"
                 prompt_objective = f"Write a high-level overview of the {org_tag} domain ({entity_name}). Synthesize all sub-projects and activity under this domain."
                 scope_rules = f"""DOMAIN SCOPE: This page covers the {org_tag} domain and its sub-projects only.
-EXCLUDE: Any content related to other domains (SOLVSTRAT, QHORD, ASHRAYA, PERSONAL, CRAYON).
+EXCLUDE: Any content related to other domains.
 DOMAIN DESCRIPTION: {org_context}"""
             else:
-                prompt_role = "Knowledge Curator for Danny's OS"
+                prompt_role = "Knowledge Curator for {owner_name}'s OS"
                 prompt_objective = f"Update the Master Page for {entity_name} (under {org_tag})."
                 scope_rules = f"""PROJECT SCOPE: This page is ONLY for {entity_name} under {org_tag}.
 EXCLUDE: Any content about other projects, clients, or domains.
 DOMAIN CONTEXT: {entity_name} belongs to {org_tag} ({org_context})."""
 
-            per_prompt = f"""
+            per_prompt = render_prompt(f"""
 ROLE: {prompt_role}
 OBJECTIVE: {prompt_objective}
 
@@ -216,7 +215,7 @@ EXISTING PAGE:
 
 NEW FRAGMENTS:
 {json.dumps(entry['new_fragments'], indent=2)}
-"""
+""")
             try:
                 response = await call_gemini_with_retry(
                     prompt=per_prompt,
@@ -249,14 +248,14 @@ NEW FRAGMENTS:
 
             try:
                 if existing_id:
-                    version_res = supabase.table('canonical_pages') \
+                    version_res = get_supabase().table('canonical_pages') \
                         .select('version') \
                         .eq('id', existing_id) \
                         .single() \
                         .execute()
                     old_version = (version_res.data.get('version') or 0) if version_res.data else 0
 
-                    supabase.table('canonical_pages') \
+                    get_supabase().table('canonical_pages') \
                         .update({
                             "content": markdown,
                             "embedding": embedding,
@@ -271,7 +270,7 @@ NEW FRAGMENTS:
 
                     print(f"Master Page Updated: {entity_name} (v{old_version + 1}, {payload_entry['fragment_count']} fragments)")
                 else:
-                    supabase.table('canonical_pages').insert({
+                    get_supabase().table('canonical_pages').insert({
                         "title": entity_name,
                         "project_id": project_id,
                         "content": markdown,

@@ -7,11 +7,10 @@ from datetime import datetime, timedelta, timezone
 
 from core.lib.audit_logger import info, warning, error, audit_log_sync
 from core.lib.rate_limiter import flash_lite_limiter
-from core.services.db import get_supabase, get_embedding, fetch_active_projects, zombie_recovery, versioned_update
+from core.services.db import user_query, user_insert, get_supabase, get_embedding, fetch_active_projects, zombie_recovery, versioned_update
 from core.services.google_service import format_rfc3339, sync_to_calendar, sync_to_google, delete_calendar_event, get_tasks_service
+from core.lib.prompt_template import render_prompt
 from core.services.llm import call_gemini_classify, CLASSIFICATION_MODEL, get_gemini_client
-
-supabase = get_supabase()
 
 
 def is_bare_url(text: str) -> bool:
@@ -27,7 +26,7 @@ def build_combined_prompt(text: str, projects: list) -> str:
         for p in projects
     ]) if projects else "  - General (tag: INBOX)"
 
-    return f"""You are Danny's task processor. Analyze this message.
+    return render_prompt(f"""You are {{owner_name}}'s task processor. Analyze this message.
 
 Current date and time: {date_context}
 
@@ -61,7 +60,7 @@ STRICT RULES:
 - Never make up or hallucinate details not in the message
 
 Return ONLY valid JSON:
-{{
+{{{{
   "category": "TASK|COMPLETION|NOTE|NOISE",
   "title": "...",
   "project_name": "...",
@@ -69,7 +68,8 @@ Return ONLY valid JSON:
   "duration_mins": 15,
   "priority": "important",
   "status": "todo"
-}}"""
+}}}}
+""")
 
 
 async def process_single_dump(text: str, metadata: dict, tasks_service=None) -> dict:
@@ -98,7 +98,7 @@ async def process_single_dump(text: str, metadata: dict, tasks_service=None) -> 
     if category == 'NOTE':
         embedding = get_embedding(text)
         try:
-            supabase.table('memories').insert({
+            user_insert('memories', {
                 "content": text,
                 "memory_type": "note",
                 "embedding": embedding,
@@ -121,7 +121,7 @@ async def process_single_dump(text: str, metadata: dict, tasks_service=None) -> 
     explicit_time = bool(result.get('reminder_at') and 'T' in str(result.get('reminder_at')))
 
     dedup_key = hashlib_md5(f"{title.lower().strip()}:{project_id or 0}".encode())[:16]
-    existing = supabase.table('tasks').select('id') \
+    existing = user_query('tasks').select('id') \
         .eq('dedup_key', dedup_key) \
         .not_.in_('status', ['done', 'cancelled']) \
         .limit(1).execute()
@@ -129,7 +129,7 @@ async def process_single_dump(text: str, metadata: dict, tasks_service=None) -> 
         return {"action": "skipped", "reason": "duplicate", "task_id": existing.data[0]['id']}
 
     if category == 'COMPLETION':
-        task_ref = supabase.table('tasks').select('id, google_task_id, google_event_id, title, status') \
+        task_ref = user_query('tasks').select('id, google_task_id, google_event_id, title, status') \
             .eq('dedup_key', dedup_key) \
             .eq('is_current', True) \
             .maybe_single().execute()
@@ -156,7 +156,7 @@ async def process_single_dump(text: str, metadata: dict, tasks_service=None) -> 
     }
 
     try:
-        insert_res = supabase.table('tasks').insert(task_insert).execute()
+        insert_res = user_insert('tasks', task_insert).execute()
         task_id = insert_res.data[0]['id']
     except Exception as e:
         audit_log_sync("quick_process", "ERROR", f"Task insert failed: {e}")
@@ -183,7 +183,7 @@ async def process_single_dump(text: str, metadata: dict, tasks_service=None) -> 
         if g_id:
             update['google_task_id'] = g_id
         try:
-            supabase.table('tasks').update(update).eq('id', task_id).execute()
+            user_query('tasks').update(update).eq('id', task_id).execute()
         except Exception:
             pass
 
@@ -197,7 +197,7 @@ def hashlib_md5(data: bytes) -> str:
 async def process_pending_dumps():
     zombie_recovery()
 
-    dumps_res = supabase.table('raw_dumps') \
+    dumps_res = user_query('raw_dumps') \
         .select('id, content, metadata, message_type') \
         .eq('status', 'pending') \
         .execute()
@@ -217,7 +217,7 @@ async def process_pending_dumps():
             except Exception:
                 meta = {}
 
-        lock_res = supabase.table('raw_dumps') \
+        lock_res = user_query('raw_dumps') \
             .update({"status": "processing"}) \
             .eq('id', d['id']) \
             .eq('status', 'pending') \
@@ -228,18 +228,18 @@ async def process_pending_dumps():
         result = await process_single_dump(d['content'], meta, tasks_service)
 
         if result.get('action') in ('created', 'completed', 'filed'):
-            supabase.table('raw_dumps').update({
+            user_query('raw_dumps').update({
                 "status": "synced"
             }).eq('id', d['id']).execute()
             processed += 1
             audit_log_sync("quick_process", "INFO", f"Processed dump {d['id']}: {result['action']}")
         elif result.get('action') == 'error':
-            supabase.table('raw_dumps').update({
+            user_query('raw_dumps').update({
                 "status": "pending",
                 "metadata": {**meta, "quick_process_error": result.get('reason')}
             }).eq('id', d['id']).execute()
         else:
-            supabase.table('raw_dumps').update({
+            user_query('raw_dumps').update({
                 "status": "completed",
                 "is_processed": True
             }).eq('id', d['id']).execute()

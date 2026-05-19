@@ -10,11 +10,10 @@ from datetime import datetime, timedelta, timezone
 from core.lib.constants import EmailStatus
 from core.lib.people_utils import normalize_person_name, is_blocklisted_person
 from core.lib.duplicate_guard import check_duplicate
-from core.services.db import get_supabase, get_embedding
+from core.services.db import user_query, user_insert, get_supabase, get_embedding
 from core.services.google_service import get_google_creds, _MemoryCache
 from core.services.llm import call_gemini_classify, get_gemini_client
-
-supabase = get_supabase()
+from core.lib.prompt_template import render_prompt
 
 RETRYABLE_ERRORS = ['503', '504', '500', 'disconnected', 'timeout', 'deadline exceeded', 'unavailable', 'overloaded', 'rate limit']
 NOREPLY_PATTERNS = [
@@ -28,7 +27,7 @@ NOREPLY_PATTERNS = [
 
 def build_active_task_list() -> list:
     try:
-        result = supabase.table('tasks')\
+        result = user_query('tasks')\
             .select('id, title')\
             .not_.in_('status', ['done', 'cancelled'])\
             .execute()
@@ -39,12 +38,12 @@ def build_active_task_list() -> list:
 
 
 async def generate_draft(sender: str, subject: str, body: str) -> str:
-    prompt = f"""You are drafting a professional reply on behalf of Danny (Yashwant Daniel), founder of Crayon. Write a concise, warm, and direct reply to this email. Do not sign off with a full signature block — end with just 'Danny'. Do not send — this is a draft for Danny's review.
+    prompt = render_prompt(f"""You are drafting a professional reply on behalf of {{owner_name}} ({{owner_full_name}}), founder of {{company_name}}. Write a concise, warm, and direct reply to this email. Do not sign off with a full signature block — end with just '{{owner_name}}'. Do not send — this is a draft for {{owner_name}}'s review.
 
 Sender: {sender}
 Subject: {subject}
 Body:
-{body[:1000]}"""
+{body[:1000]}""")
 
     try:
         response = await call_gemini_classify(prompt, model="gemini-3.1-flash-lite-preview")
@@ -64,7 +63,7 @@ async def add_person_from_email(name: str, email: str = None, source: str = 'ema
         print(f"Skipping blocklisted person from email: {name_clean}")
         return None
 
-    existing = supabase.table('people').select('id, name').execute()
+    existing = user_query('people').select('id, name').execute()
     existing_names = {}
     for p in (existing.data or []):
         existing_names[p['name'].lower()] = p['id']
@@ -81,7 +80,7 @@ async def add_person_from_email(name: str, email: str = None, source: str = 'ema
     if matched is not None:
         return matched
 
-    result = supabase.table('people').insert({
+    result = user_insert('people', {
         "name": name_clean,
         "role": None,
         "strategic_weight": 5,
@@ -95,13 +94,13 @@ async def add_person_from_email(name: str, email: str = None, source: str = 'ema
 
 
 async def write_relationship_note(sender_name: str, sender_email: str, subject: str, summary: str, people_id: int = None):
-    prompt = f"""Synthesize a brief relationship note based on this email interaction. Focus on: who sent it, what was communicated, why it matters for Danny's relationship knowledge graph. NOT a raw summary.
+    prompt = render_prompt(f"""Synthesize a brief relationship note based on this email interaction. Focus on: who sent it, what was communicated, why it matters for {{owner_name}}'s relationship knowledge graph. NOT a raw summary.
 
 Sender: {sender_name} ({sender_email})
 Subject: {subject}
 Summary: {summary}
 
-Output ONLY a concise 1-2 sentence note about the relationship context."""
+Output ONLY a concise 1-2 sentence note about the relationship context.""")
 
     try:
         response = await call_gemini_classify(prompt, model="gemini-3.1-flash-lite-preview")
@@ -112,7 +111,7 @@ Output ONLY a concise 1-2 sentence note about the relationship context."""
         if people_id:
             metadata['people_id'] = people_id
 
-        supabase.table('memories').insert({
+        user_insert('memories', {
             "content": note_content,
             "memory_type": "relationship_note",
             "embedding": embedding,
@@ -217,17 +216,15 @@ def decode_html_body(payload: dict) -> str:
 
 
 async def classify_email(sender: str, subject: str, body: str, to_header: str = '', cc_header: str = '') -> dict:
-    prompt = f"""You are classifying an email for Danny (Yashwant Daniel), founder of Crayon, Chennai, India.
+    prompt = render_prompt(f"""You are classifying an email for {{owner_name}} ({{owner_full_name}}), founder of {{company_name}}, {{location}}.
 
-MAILBOX CONTEXT: This is Danny's PERSONAL Gmail inbox. It is scoped strictly to two labels:
-- inbox: personal correspondence, family, church-related work
-- Completed/Ashraya: Ashraya is a church ministry Danny leads
+MAILBOX CONTEXT: This is {{owner_name}}'s PERSONAL Gmail inbox. It is scoped strictly to personal and community correspondence.
 
-This mailbox does NOT receive Crayon business emails, client work, or vendor communications. Those go to his Outlook work inbox.
+This mailbox does NOT receive {{company_name}} business emails or vendor communications.
 
 What legitimately arrives here:
 - Personal contacts: family, friends, personal relationships
-- Church contacts: pastors, ministry team, Ashraya volunteers, church admin, event coordination
+- Community contacts: volunteers, coordinators, community admin, event coordination
 - Personal finances: CA, personal banking, insurance (human-sent, not automated alerts)
 - Government correspondence: direct human responses from officials (not automated portal emails)
 - Personal vendors: doctor, school, personal services
@@ -249,24 +246,24 @@ CLASSIFY AS "ignored" IF ANY of these are true:
 - Subject starts with FW: or Fwd: with no new content added
 
 CLASSIFY AS "fyi" IF:
-- Danny is in CC or BCC (not primary To: recipient)
-- A real person is sharing information — a church update, ministry report, or personal FYI — where no response is expected or needed
+- {{owner_name}} is in CC or BCC (not primary To: recipient)
+- A real person is sharing information where no response is expected or needed
 
 CLASSIFY AS "actionable" IF:
-- Addressed directly To: Danny
-- From a real individual (family, friend, church member, ministry volunteer, pastor, personal contact)
-- Requires Danny to respond, decide, coordinate, approve, or take an action
-- Church coordination, Ashraya ministry tasks, personal obligations, and family matters all qualify
+- Addressed directly To: {{owner_name}}
+- From a real individual
+- Requires {{owner_name}} to respond, decide, coordinate, approve, or take an action
+- Personal obligations, community matters, and family matters all qualify
 
 OUTPUT RULES
 
 suggested_task:
-- Verb-first, specific action (e.g., "Confirm attendance for Ashraya prayer meeting with Elder Thomas", "Call Amma about Sunday lunch plan")
+- Verb-first, specific action (e.g., "Confirm attendance at community meeting", "Call about weekend plans")
 - NULL if fyi or ignored
 - NULL if action cannot be stated specifically
 
 needs_draft:
-- true if Danny needs to write a reply
+- true if {{owner_name}} needs to write a reply
 - true if is_human_sender = true AND the sender is waiting for acknowledgement,
   confirmation, or an update — even if the task itself is an offline action
 - false ONLY if the task is a call, meeting, or internal action where
@@ -282,7 +279,7 @@ has_memory_value:
 - Can only be true if is_human_sender is also true
 
 Return ONLY valid JSON, NO markdown, NO explanation:
-{{
+{{{{
   "classification": "ignored|fyi|actionable",
   "summary": "2 sentences max. Who sent it, what they want or shared.",
   "suggested_task": "verb-first task or null",
@@ -291,7 +288,8 @@ Return ONLY valid JSON, NO markdown, NO explanation:
   "linked_project_name": "project or ministry name if mentioned, else null",
   "is_human_sender": true or false,
   "has_memory_value": true or false
-}}"""
+}}}}
+""")
 
     response = await call_gemini_classify(
         prompt,
@@ -308,7 +306,7 @@ async def process_email(msg_data: dict, gmail_service, active_tasks: list) -> tu
     subject = None
 
     try:
-        existing = supabase.table('emails').select('id').eq('message_id', msg_id).maybe_single().execute()
+        existing = user_query('emails').select('id').eq('message_id', msg_id).maybe_single().execute()
         if existing is not None and existing.data:
             return (EmailStatus.IGNORED, msg_data.get('snippet', '')[:50])
     except Exception as e:
@@ -346,7 +344,7 @@ async def process_email(msg_data: dict, gmail_service, active_tasks: list) -> tu
         classification = classification_data.get('classification', 'ignored')
 
         if classification == 'ignored':
-            supabase.table('emails').insert({
+            user_insert('emails', {
                 "message_id": msg_id,
                 "thread_id": full_msg.get('threadId', ''),
                 "source": "gmail",
@@ -376,7 +374,7 @@ async def process_email(msg_data: dict, gmail_service, active_tasks: list) -> tu
         }
 
         if classification == 'fyi':
-            insert_res = supabase.table('emails').insert(email_row).execute()
+            insert_res = user_insert('emails', email_row).execute()
             if not insert_res.data:
                 print(f"Email insert returned no data for {subject}")
                 return ('error', 'insert returned no data')
@@ -407,11 +405,11 @@ async def process_email(msg_data: dict, gmail_service, active_tasks: list) -> tu
                 if is_blocklisted_person(linked_person_name):
                     print(f"Skipping blocklisted linked person: {linked_person_name}")
                 else:
-                    person_res = supabase.table('people').select('id, name').ilike('name', f'%{linked_person_name}%').maybe_single().execute()
+                    person_res = user_query('people').select('id, name').ilike('name', f'%{linked_person_name}%').maybe_single().execute()
                     if getattr(person_res, 'data', None):
                         linked_person_id = person_res.data['id']
                     else:
-                        new_person = supabase.table('people').insert({
+                        new_person = user_insert('people', {
                             "name": linked_person_name,
                             "source": "email_ingest",
                             "strategic_weight": 5
@@ -429,14 +427,14 @@ async def process_email(msg_data: dict, gmail_service, active_tasks: list) -> tu
             linked_project_id = None
             linked_project_name = classification_data.get('linked_project_name')
             if linked_project_name:
-                project_res = supabase.table('projects').select('id, name').ilike('name', f'%{linked_project_name}%').maybe_single().execute()
+                project_res = user_query('projects').select('id, name').ilike('name', f'%{linked_project_name}%').maybe_single().execute()
                 if getattr(project_res, 'data', None):
                     linked_project_id = project_res.data['id']
 
             email_row['linked_person_id'] = linked_person_id
             email_row['linked_project_id'] = linked_project_id
 
-            insert_res = supabase.table('emails').insert(email_row).execute()
+            insert_res = user_insert('emails', email_row).execute()
             if not insert_res.data:
                 print(f"Email insert returned no data for {subject}")
                 return ('error', 'insert returned no data')
@@ -450,31 +448,31 @@ async def process_email(msg_data: dict, gmail_service, active_tasks: list) -> tu
                 if guard['result'] == 'block':
                     if guard['is_superset'] and guard['matched_id']:
                         try:
-                            supabase.table('tasks').update({'title': suggested_title}).eq('id', guard['matched_id']).execute()
+                            user_query('tasks').update({'title': suggested_title}).eq('id', guard['matched_id']).execute()
                             print(f"Auto-updated task {guard['matched_id']}: '{guard['matched_title']}' -> '{suggested_title}'")
                         except Exception as upd_err:
                             print(f"Auto-update failed: {upd_err}")
                     else:
                         print(f"Duplicate guard (block): '{suggested_title}' matches existing task [{guard['matched_id']}]. Skipping.")
                 elif guard['result'] == 'flag':
-                    supabase.table('email_pending_tasks').insert({
+                    user_insert('email_pending_tasks', {
                         "email_id": email_id,
                         "suggested_title": suggested_task,
                         "suggested_project": linked_project_name,
                         "shown_in_brief": False,
-                        "danny_decision": None,
+                        "user_decision": None,
                         "is_human_sender": is_human,
                         "possible_duplicate": True,
                         "duplicate_of_title": guard['matched_title']
                     }).execute()
                     print(f"Duplicate guard (flag): '{suggested_title}' may be similar to task '{guard['matched_title']}'. Created with flag.")
                 else:
-                    supabase.table('email_pending_tasks').insert({
+                    user_insert('email_pending_tasks', {
                         "email_id": email_id,
                         "suggested_title": suggested_task,
                         "suggested_project": linked_project_name,
                         "shown_in_brief": False,
-                        "danny_decision": None,
+                        "user_decision": None,
                         "is_human_sender": is_human
                     }).execute()
 
@@ -490,7 +488,7 @@ async def process_email(msg_data: dict, gmail_service, active_tasks: list) -> tu
             if classification_data.get('needs_draft'):
                 draft_body = await generate_draft(sender_name, subject, body)
                 if draft_body:
-                    supabase.table('email_drafts').insert({
+                    user_insert('email_drafts', {
                         "email_id": email_id,
                         "draft_body": draft_body,
                         "status": "pending"
@@ -503,7 +501,7 @@ async def process_email(msg_data: dict, gmail_service, active_tasks: list) -> tu
     except Exception as e:
         print(f"Error processing email {msg_id}: {e}")
         try:
-            supabase.table('emails').insert({
+            user_insert('emails', {
                 "message_id": msg_id,
                 "source": "gmail",
                 "sender": sender_name or "unknown",

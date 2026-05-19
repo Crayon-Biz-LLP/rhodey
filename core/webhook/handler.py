@@ -6,11 +6,13 @@ from core.lib.audit_logger import audit_log_sync
 from core.lib.conversation import get_or_create_session, log_exchange, format_history_for_prompt
 from core.webhook.telegram import send_telegram, download_telegram_file
 from core.webhook.classify import classify_intent, detect_opportunity_language, check_task_overlap_for_update, UPDATE_TRIGGER_WORDS
-from core.webhook.utils import supabase, trigger_github_pulse, get_recent_context
+from core.webhook.utils import trigger_github_pulse, get_recent_context
 from core.webhook.email import process_email_pending_decision, handle_ed_command
 from core.webhook.dispatch import route_by_intent, ask_task_update_confirmation, resolve_task_update_confirmation, ask_intent_disambiguation, resolve_disambiguation, ask_task_or_note_confirmation, resolve_task_note_confirmation, handle_daily_brief, interrogate_brain, handle_confident_note, handle_clarification
 from core.webhook.commands import handle_command, handle_undo_command
 from core.webhook.multimodal import process_multimodal_content
+from core.services.db import set_current_user, user_query, user_insert, get_supabase
+from core.services.onboarding import verify_telegram_code
 
 
 async def process_webhook(update: dict):
@@ -18,10 +20,10 @@ async def process_webhook(update: dict):
         update_id = update.get('update_id')
         if update_id and isinstance(update_id, (int, float)):
             try:
-                supabase.table('processed_updates').insert({"update_id": int(update_id)}).execute()
+                get_supabase().table('processed_updates').insert({"update_id": int(update_id)}).execute()
                 try:
                     cutoff = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
-                    supabase.table('processed_updates').delete().lt('processed_at', cutoff).execute()
+                    get_supabase().table('processed_updates').delete().lt('processed_at', cutoff).execute()
                 except Exception as cleanup_e:
                     audit_log_sync("webhook", "WARNING", f"Dedup cleanup failed (non-critical): {cleanup_e}")
             except Exception as e:
@@ -61,16 +63,34 @@ async def process_webhook(update: dict):
         chat_id = chat.get('id')
         text = message.get('text', '')
 
-        core_res = supabase.table('core_config').select('key, content').execute()
+        core_res = get_supabase().table('core_config').select('key, content').execute()
         core_json = json.dumps(core_res.data or [])
 
         if not chat_id:
             return {"success": True}
 
-        owner_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not owner_id or str(chat_id) != str(owner_id):
+        VERIFY_PATTERN = re.compile(r'^[A-Z0-9]{8}$')
+
+        telegram_link = get_supabase().table('user_telegram_links')\
+            .select('user_id').eq('chat_id', chat_id).maybe_single().execute()
+        linked_user = telegram_link.data
+
+        if text and VERIFY_PATTERN.match(text.strip().upper()):
+            code = text.strip().upper()
+            user_id = verify_telegram_code(chat_id, code)
+            if user_id:
+                await send_telegram(chat_id, "✅ Telegram linked! You can now use Rhodey.")
+                return {"success": True, "message": "Telegram linked"}
+            else:
+                await send_telegram(chat_id, "❌ Invalid or expired verification code. Request a new one from the onboarding page.")
+                return {"success": False, "message": "Invalid code"}
+
+        if not linked_user:
             print(f"Unauthorized access from Chat ID: {chat_id}")
             return {"message": "Unauthorized"}
+
+        user_id = linked_user["user_id"]
+        set_current_user(user_id)
 
         if not text:
             photo = message.get('photo')
@@ -132,7 +152,7 @@ async def process_webhook(update: dict):
 
                 if not _is_approve and result['action'] == 'not_found':
                     try:
-                        _node_res = supabase.table('graph_nodes') \
+                        _node_res = user_query('graph_nodes') \
                             .select('id, label, metadata') \
                             .eq('type', 'practice') \
                             .eq('metadata->>shortcode', str(_shortcode)) \
@@ -146,14 +166,14 @@ async def process_webhook(update: dict):
                                 _rm = json.loads(_rm)
                             _rm['status'] = 'dismissed'
                             _rm['dismissed_at'] = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime('%Y-%m-%d')
-                            supabase.table('graph_nodes').update({'metadata': _rm}).eq('id', _n['id']).execute()
+                            user_query('graph_nodes').update({'metadata': _rm}).eq('id', _n['id']).execute()
                             _variants = _rm.get('variants', [_n.get('label', '')])
-                            _excl = supabase.table('core_config').select('content').eq('key', 'dismissed_practice_variants').maybe_single().execute()
+                            _excl = get_supabase().table('core_config').select('content').eq('key', 'dismissed_practice_variants').maybe_single().execute()
                             _existing = json.loads(_excl.data.get('content', '[]')) if _excl.data else []
                             _existing_lower = set(v.lower() for v in _existing)
                             _new_entries = [v for v in _variants if v.lower() not in _existing_lower]
                             if _new_entries:
-                                supabase.table('core_config').update({'content': json.dumps(_existing + _new_entries)}).eq('key', 'dismissed_practice_variants').execute()
+                                get_supabase().table('core_config').update({'content': json.dumps(_existing + _new_entries)}).eq('key', 'dismissed_practice_variants').execute()
                             await send_telegram(chat_id, f"Dismissed: {_n.get('label', '')}")
                             print(f"SHORTCODE DROP: Dismissed practice '{_n.get('label', '')}' via shortcode.")
                             return {"success": True}
@@ -180,7 +200,7 @@ async def process_webhook(update: dict):
                                       'q', 'query', 'b', 'daily_brief', 'r', 'delegate', 'p', 'declare_practice', 'x', 'noise'}
         if text.strip().lower() in CLARIFICATION_REPLY_WORDS:
             try:
-                last_clar = supabase.table('conversations') \
+                last_clar = user_query('conversations') \
                     .select('content') \
                     .eq('session_id', session_id) \
                     .eq('role', 'bot') \
@@ -221,7 +241,7 @@ async def process_webhook(update: dict):
         if _drop_match:
             practice_name = _drop_match.group(1).strip().replace('-', ' ')
             try:
-                node_res = supabase.table('graph_nodes') \
+                node_res = user_query('graph_nodes') \
                     .select('id, label, metadata') \
                     .eq('type', 'practice') \
                     .ilike('label', practice_name) \
@@ -242,13 +262,13 @@ async def process_webhook(update: dict):
                 raw_meta['status'] = 'dismissed'
                 raw_meta['dismissed_at'] = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime('%Y-%m-%d')
 
-                supabase.table('graph_nodes') \
+                user_query('graph_nodes') \
                     .update({'metadata': raw_meta}) \
                     .eq('id', node['id']) \
                     .execute()
 
                 variants = raw_meta.get('variants', [node.get('label', practice_name)])
-                exclusion_res = supabase.table('core_config') \
+                exclusion_res = get_supabase().table('core_config') \
                     .select('content') \
                     .eq('key', 'dismissed_practice_variants') \
                     .maybe_single() \
@@ -258,7 +278,7 @@ async def process_webhook(update: dict):
                 new_entries = [v for v in variants if v.lower() not in existing_lower]
                 if new_entries:
                     updated_exclusion = existing_exclusion + new_entries
-                    supabase.table('core_config') \
+                    get_supabase().table('core_config') \
                         .update({'content': json.dumps(updated_exclusion)}) \
                         .eq('key', 'dismissed_practice_variants') \
                         .execute()

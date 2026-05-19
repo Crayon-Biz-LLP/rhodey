@@ -20,9 +20,117 @@ from core.pulse import (
     get_google_creds,
     format_rfc3339,
 )
-from core.services.db import get_supabase
+from core.services.db import get_supabase, set_current_user, user_query, user_insert
+from core.services.onboarding import (
+    register_user, get_user_status, approve_user, get_pending_users,
+    get_persona, set_persona, complete_onboarding,
+    generate_telegram_verification_code, verify_telegram_code,
+)
+from core.lib.auth import require_auth, get_current_user
+from core.lib.domain_utils import DEFAULT_DOMAINS
 
 app = FastAPI(title="Integrated-OS")
+
+
+# ==================== AUTH & ONBOARDING ====================
+
+@app.post("/api/auth/register")
+async def auth_register_route(request: Request):
+    """Register after Google OAuth. Creates a pending user profile."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    body = await request.json()
+    profile = register_user(user.id, user.email, body.get("owner_name"))
+    return {"registered": True, "approval_status": profile.get("approval_status", "pending")}
+
+
+@app.get("/api/auth/status")
+async def auth_status_route(request: Request):
+    """Get current user's registration/approval/onboarding status."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    return get_user_status(user.id)
+
+
+@app.post("/api/admin/users/approve")
+async def admin_approve_user_route(request: Request):
+    """Admin approves a pending user."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    body = await request.json()
+    target = body.get("user_id")
+    if not target:
+        raise HTTPException(status_code=400, detail="user_id required")
+    ok = approve_user(user.id, target)
+    if not ok:
+        raise HTTPException(status_code=403, detail="Not authorized or user not found")
+    return {"success": True}
+
+
+@app.get("/api/admin/users/pending")
+async def admin_pending_users_route(request: Request):
+    """List pending users (admin only)."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    return {"users": get_pending_users(user.id)}
+
+
+@app.get("/api/onboarding/persona")
+async def get_persona_route(request: Request):
+    """Get current user's persona configuration."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    return get_persona(user.id)
+
+
+@app.post("/api/onboarding/persona")
+async def set_persona_route(request: Request):
+    """Update persona (name, company, location, domains)."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    body = await request.json()
+    set_persona(user.id, body)
+    return {"success": True}
+
+
+@app.post("/api/onboarding/complete")
+async def complete_onboarding_route(request: Request):
+    """Mark onboarding wizard as complete."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    complete_onboarding(user.id)
+    return {"success": True}
+
+
+@app.post("/api/onboarding/telegram/link")
+async def telegram_link_route(request: Request):
+    """Generate a verification code to link Telegram."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    code = generate_telegram_verification_code(user.id)
+    return {"code": code, "expires_in_minutes": 10}
+
+
+@app.get("/api/onboarding/domains")
+async def get_domains_route(request: Request):
+    """Get the user's domain configuration (or defaults if not set)."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    persona = get_persona(user.id)
+    config = persona.get("domains_config") or DEFAULT_DOMAINS
+    return {"domains_config": config, "defaults": DEFAULT_DOMAINS}
+
+
+@app.post("/api/onboarding/domains")
+async def save_domains_route(request: Request):
+    """Save the user's custom domain configuration."""
+    user = get_current_user(request)
+    set_current_user(user.id)
+    body = await request.json()
+    domains = body.get("domains_config", [])
+    set_persona(user.id, {"domains_config": domains})
+    return {"success": True}
+
 
 # CORS setup for future dashboard scalability
 app.add_middleware(
@@ -52,14 +160,6 @@ def verify_hmac(payload: bytes, signature: str, secret: str) -> bool:
     expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
 
-def require_api_auth(request: Request):
-    api_key = request.headers.get("X-API-Key")
-    expected = os.getenv("API_SECRET_KEY")
-    if not expected:
-        return
-    if not api_key or not hmac.compare_digest(api_key, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
 # --- THE PULSE ENGINE (Routes to pulse.py) ---
 @app.post("/api/pulse")
 async def pulse_route_post(request: Request):
@@ -71,13 +171,12 @@ async def pulse_route_post(request: Request):
     if not verify_hmac(raw_body, sig_header, pulse_secret):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     
-    # Extracts the secret from the GitHub Actions cron header
     secret = request.headers.get("x-pulse-secret")
+    body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+    user_id = body.get("user_id") or request.query_params.get("user_id")
     
-    # Executes the strategic briefing logic
-    result = await process_pulse(auth_secret=secret)
+    result = await process_pulse(auth_secret=secret, user_id=user_id)
     
-    # Gatekeeper error handling
     if result.get("error"):
         raise HTTPException(status_code=result.get("status", 500), detail=result["error"])
         
@@ -86,7 +185,9 @@ async def pulse_route_post(request: Request):
 # --- SEND DRAFT REPLY (Routes to webhook.py) ---
 @app.post("/api/send-draft")
 async def send_draft_route(request: Request):
-    require_api_auth(request)
+    user = require_auth(request)
+    if user:
+        set_current_user(user.id)
     body = await request.json()
     draft_id = body.get("draft_id")
     if not draft_id:
@@ -97,7 +198,9 @@ async def send_draft_route(request: Request):
 # --- SEND MESSAGE VIA WEB UI (Mirrors Telegram exactly) ---
 @app.post("/api/send-message")
 async def send_message_route(request: Request):
-    require_api_auth(request)
+    user = require_auth(request)
+    if user:
+        set_current_user(user.id)
     try:
         body = await request.json()
         message_text = body.get("message")
@@ -136,10 +239,11 @@ async def send_message_route(request: Request):
 # --- GET MESSAGE HISTORY ---
 @app.get("/api/messages")
 async def get_messages_route(request: Request, limit: int = 50, offset: int = 0):
-    require_api_auth(request)
+    user = require_auth(request)
+    if user:
+        set_current_user(user.id)
     try:
-        supabase = get_supabase()
-        result = supabase.table('raw_dumps')\
+        result = user_query('raw_dumps')\
             .select('id, content, created_at, direction, sender, message_type, status, metadata, source')\
             .order('created_at', desc=True)\
             .limit(limit)\
@@ -153,7 +257,9 @@ async def get_messages_route(request: Request, limit: int = 50, offset: int = 0)
 # --- CALENDAR EVENTS (Fetches from Google + Outlook) ---
 @app.get("/api/calendar-events")
 async def get_calendar_events(request: Request, date: str = None, start: str = None, end: str = None):
-    require_api_auth(request)
+    user = require_auth(request)
+    if user:
+        set_current_user(user.id)
     try:
         from googleapiclient.discovery import build
 
@@ -217,14 +323,14 @@ async def get_calendar_events(request: Request, date: str = None, start: str = N
 # --- UPDATE TASK STATUS (Mark Done) ---
 @app.patch("/api/tasks/{task_id}/status")
 async def update_task_status(request: Request, task_id: int):
-    require_api_auth(request)
+    user = require_auth(request)
+    if user:
+        set_current_user(user.id)
     try:
         body = await request.json()
         new_status = body.get('status', 'done')
 
-        supabase = get_supabase()
-
-        task_res = supabase.table('tasks').select('*').eq('id', task_id).eq('is_current', True).single().execute()
+        task_res = user_query('tasks').select('*').eq('id', task_id).eq('is_current', True).single().execute()
         if not task_res.data:
             raise HTTPException(status_code=404, detail="Task not found")
 
@@ -266,11 +372,11 @@ async def update_task_status(request: Request, task_id: int):
             proj_name = None
             proj_id = task.get('project_id')
             if proj_id:
-                proj_lookup = supabase.table('projects').select('name').eq('id', proj_id).maybe_single().execute()
+                proj_lookup = user_query('projects').select('name').eq('id', proj_id).maybe_single().execute()
                 proj_name = proj_lookup.data['name'] if proj_lookup.data else None
             await write_outcome_memory(task_title, proj_name)
 
-        new_task_res = supabase.table('tasks').select('*').eq('supersedes_id', task_id).eq('is_current', True).single().execute()
+        new_task_res = user_query('tasks').select('*').eq('supersedes_id', task_id).eq('is_current', True).single().execute()
         new_task = new_task_res.data if new_task_res.data else task
 
         return {"success": True, "task": new_task}
@@ -285,7 +391,9 @@ async def update_task_status(request: Request, task_id: int):
 @app.post("/api/email-action")
 async def email_action_route(request: Request):
     """Approve or reject email pending task via API (called from frontend)."""
-    require_api_auth(request)
+    user = require_auth(request)
+    if user:
+        set_current_user(user.id)
     try:
         body = await request.json()
         pending_id = body.get('id') or body.get('shortcode')

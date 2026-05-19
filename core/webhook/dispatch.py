@@ -2,7 +2,6 @@ import os
 import json
 import asyncio
 from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from core.lib.audit_logger import audit_log_sync
@@ -11,7 +10,9 @@ from core.services.pipeline_service import add_to_failed_queue
 from core.lib.conversation import get_history, log_exchange, format_history_for_prompt
 from core.webhook.telegram import send_telegram
 from core.webhook.classify import call_gemini_with_retry, CLASSIFICATION_MODEL, get_embedding, INTENT_OPTIONS, INTENT_BY_KEYWORD
-from core.webhook.utils import is_recent_raw_dump, get_google_creds, MemoryCache, hybrid_search_graph, supabase
+from core.webhook.utils import is_recent_raw_dump, get_google_creds, MemoryCache, hybrid_search_graph
+from core.services.db import user_query, user_insert, get_supabase
+from core.lib.prompt_template import render_prompt
 
 try:
     from core.agents.quick_process import process_single_dump, get_tasks_service
@@ -20,6 +21,7 @@ except ImportError:
         return {"action": "skipped", "reason": "import_failed"}
     def get_tasks_service():
         return None
+
 
 
 def _format_task_line(title: str, project_name: str, priority: str = None, suffix: str = "") -> str:
@@ -88,7 +90,7 @@ async def handle_daily_brief(text: str, chat_id: int, session_id: str = None, co
 
         # All active pending tasks
         try:
-            tasks_res = supabase.table('tasks') \
+            tasks_res = user_query('tasks') \
                 .select('id, title, priority, project_id, status, reminder_at, created_at') \
                 .eq('is_current', True) \
                 .not_.in_('status', ['done', 'cancelled']) \
@@ -100,7 +102,7 @@ async def handle_daily_brief(text: str, chat_id: int, session_id: str = None, co
                 proj_ids = list(set(t.get('project_id') for t in raw_tasks if t.get('project_id')))
                 proj_map = {}
                 if proj_ids:
-                    proj_res = supabase.table('projects').select('id, name, org_tag').in_('id', proj_ids).execute()
+                    proj_res = user_query('projects').select('id, name, org_tag').in_('id', proj_ids).execute()
                     for p in (proj_res.data or []):
                         proj_map[p['id']] = p['name']
                 for t in raw_tasks:
@@ -123,7 +125,7 @@ async def handle_daily_brief(text: str, chat_id: int, session_id: str = None, co
 
         # Recent completions
         try:
-            comp_res = supabase.table('tasks') \
+            comp_res = user_query('tasks') \
                 .select('title, project_id') \
                 .eq('is_current', False) \
                 .eq('status', 'done') \
@@ -136,7 +138,7 @@ async def handle_daily_brief(text: str, chat_id: int, session_id: str = None, co
                 done_proj_ids = list(set(t.get('project_id') for t in completed_raw if t.get('project_id')))
                 done_proj_map = {}
                 if done_proj_ids:
-                    done_proj_res = supabase.table('projects').select('id, name').in_('id', done_proj_ids).execute()
+                    done_proj_res = user_query('projects').select('id, name').in_('id', done_proj_ids).execute()
                     for p in (done_proj_res.data or []):
                         done_proj_map[p['id']] = p['name']
                 for t in completed_raw:
@@ -150,11 +152,11 @@ async def handle_daily_brief(text: str, chat_id: int, session_id: str = None, co
                 return "None"
             return "\n".join(f"- {i}" for i in items)
 
-        prompt = f"""You are Danny's Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to Danny's vision. You don't coach or 'motivate.' Speak simply and punchy.
+        prompt = render_prompt(f"""You are {{owner_name}}'s Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to {{owner_name}}'s vision. You don't coach or 'motivate.' Speak simply and punchy.
 
-Danny is asking about {day_label.lower()}. You have his calendar events for {day_label}, his full active task list, overdue items, and recent completions. Identify what matters and cut through the noise.
+{{owner_name}} is asking about {day_label.lower()}. You have his calendar events for {day_label}, his full active task list, overdue items, and recent completions. Identify what matters and cut through the noise.
 
-Answer only what Danny asked. Do not list unrelated tasks or extra context.
+Answer only what {{owner_name}} asked. Do not list unrelated tasks or extra context.
 {conversation_history}
 
 {day_label.upper()} — {target.strftime('%A, %d %B')}
@@ -173,19 +175,19 @@ RECENTLY COMPLETED (24h):
 
 Give a sharp, direct answer. If you spot a bottleneck or a pattern, call it out. If something is urgent, say so. If there's nothing useful, say that.
 
-Formatting rules:
-- Emoji goes at the **start** of each task line, not at the end
-- Pick emojis naturally: 💰 money, 🏠 home, 📋 admin, 🛠️ work, 🏛️ ashraya/church, etc.
-- Do NOT use `###` headers — use **bold** or just plain text for section breaks
-- Do NOT prefix tasks with "TASK" — just list them cleanly. Do NOT include intent labels like TASK, NOTE, or QUERY anywhere in your response.
-- Bullet points only, no numbered lists
+    Formatting rules:
+    - Emoji goes at the **start** of each task line, not at the end
+    - Pick emojis naturally based on context: 💰 money, 🏠 home, 📋 admin, etc.
+    - Do NOT use `###` headers — use **bold** or just plain text for section breaks
+    - Do NOT prefix tasks with "TASK" — just list them cleanly. Do NOT include intent labels like TASK, NOTE, or QUERY anywhere in your response.
+    - Bullet points only, no numbered lists
 
-Example:
-**Focus here** — bottleneck callout.
-* 💰 Task name [Project]
-* 📋 Another task [Project]
+    Example:
+    **Focus here** — bottleneck callout.
+    * 💰 Task name [Project]
+    * 📋 Another task [Project]
 
-Always use [MEMORY] or [RESOURCE] brackets when citing — never write MEMORY or RESOURCE without brackets. Preserve the [Project] bracket from the task data exactly as shown."""
+    Always use [MEMORY] or [RESOURCE] brackets when citing — never write MEMORY or RESOURCE without brackets. Preserve the [Project] bracket from the task data exactly as shown.""")
 
         response = await call_gemini_with_retry(
             prompt=prompt,
@@ -222,7 +224,7 @@ Always use [MEMORY] or [RESOURCE] brackets when citing — never write MEMORY or
         log_exchange(session_id, 'bot', 'DAILY_BRIEF', reply, chat_id)
 
     try:
-        supabase.table('raw_dumps').insert([{
+        user_insert('raw_dumps', {
             "content": reply,
             "status": "completed",
             "is_processed": True,
@@ -231,7 +233,7 @@ Always use [MEMORY] or [RESOURCE] brackets when citing — never write MEMORY or
             "message_type": "briefing",
             "source": "pulse",
             "metadata": {"type": "daily_brief", "trigger": "on_demand"}
-        }]).execute()
+        }).execute()
     except Exception as log_err:
         audit_log_sync("webhook", "WARNING", f"Failed to log daily brief: {log_err}")
 
@@ -253,7 +255,7 @@ async def handle_confident_task(text: str, title: str, time_context: str, chat_i
 
     dump_id = None
     try:
-        dump_res = supabase.table('raw_dumps').insert([{
+        dump_res = user_insert('raw_dumps', {
             "content": text,
             "status": "pending",
             "direction": "incoming",
@@ -261,7 +263,7 @@ async def handle_confident_task(text: str, title: str, time_context: str, chat_i
             "message_type": "task",
             "source": source,
             "metadata": meta
-        }]).execute()
+        }).execute()
         dump_id = dump_res.data[0]['id'] if dump_res.data else None
     except Exception as e:
         audit_log_sync("webhook", "ERROR", f"Failed to save task dump: {e}")
@@ -271,7 +273,7 @@ async def handle_confident_task(text: str, title: str, time_context: str, chat_i
 
     # Log acknowledgment to raw_dumps so it appears in web UI
     try:
-        supabase.table('raw_dumps').insert([{
+        user_insert('raw_dumps', {
             "content": ack,
             "status": "completed",
             "is_processed": True,
@@ -279,7 +281,7 @@ async def handle_confident_task(text: str, title: str, time_context: str, chat_i
             "sender": "system",
             "message_type": "acknowledgment",
             "metadata": {"in_response_to": text, "type": "ack"}
-        }]).execute()
+        }).execute()
     except Exception as ack_err:
         audit_log_sync("webhook", "WARNING", f"Failed to log ack to raw_dumps: {ack_err}")
 
@@ -289,7 +291,7 @@ async def handle_confident_task(text: str, title: str, time_context: str, chat_i
             tasks_service = get_tasks_service()
             result = await process_single_dump(text, meta, tasks_service)
             if result.get('action') in ('created', 'completed', 'filed'):
-                supabase.table('raw_dumps').update({"status": "synced"}).eq('id', dump_id).execute()
+                user_query('raw_dumps').update({"status": "synced"}).eq('id', dump_id).execute()
                 audit_log_sync("webhook", "INFO", f"Inline processed dump {dump_id}: {result['action']}")
         except Exception as e:
             audit_log_sync("webhook", "WARNING", f"Inline processing failed for dump {dump_id}: {e}")
@@ -312,7 +314,7 @@ async def handle_confident_note(text: str, chat_id: int, receipt: str = None, so
         "metadata": {"intent": "NOTE", "entity": entity}
     }
     try:
-        dump_res = supabase.table('raw_dumps').insert([insert_data]).execute()
+        dump_res = user_insert('raw_dumps', insert_data).execute()
         dump_id = dump_res.data[0]['id'] if dump_res.data else None
     except Exception as e:
         audit_log_sync("webhook", "ERROR", f"Failed to save note dump: {e}")
@@ -327,7 +329,7 @@ async def handle_confident_note(text: str, chat_id: int, receipt: str = None, so
         # Mark as embedding_failed, write to DLQ, send retry receipt
         if dump_id:
             try:
-                supabase.table('raw_dumps').update({"status": "embedding_failed"}).eq('id', dump_id).execute()
+                user_query('raw_dumps').update({"status": "embedding_failed"}).eq('id', dump_id).execute()
             except Exception as e:
                 audit_log_sync("webhook", "ERROR", f"Failed to update dump {dump_id} to embedding_failed: {e}")
         try:
@@ -340,7 +342,7 @@ async def handle_confident_note(text: str, chat_id: int, receipt: str = None, so
 
     # ── Step 3: Save to memories (success path) ──
     try:
-        supabase.table('memories').insert({
+        user_insert('memories', {
             "content": text,
             "memory_type": "note",
             "embedding": embedding,
@@ -352,7 +354,7 @@ async def handle_confident_note(text: str, chat_id: int, receipt: str = None, so
         audit_log_sync("webhook", "ERROR", f"Failed to save note to memory: {e}")
         if dump_id:
             try:
-                supabase.table('raw_dumps').update({"status": "embedding_failed"}).eq('id', dump_id).execute()
+                user_query('raw_dumps').update({"status": "embedding_failed"}).eq('id', dump_id).execute()
             except:
                 pass
         try:
@@ -366,7 +368,7 @@ async def handle_confident_note(text: str, chat_id: int, receipt: str = None, so
     # ── Step 4: Mark as processed ──
     if dump_id:
         try:
-            supabase.table('raw_dumps').update({"status": "processed", "is_processed": True}).eq('id', dump_id).execute()
+            user_query('raw_dumps').update({"status": "processed", "is_processed": True}).eq('id', dump_id).execute()
         except Exception as e:
             audit_log_sync("webhook", "WARNING", f"Failed to mark dump {dump_id} as processed: {e}")
 
@@ -375,7 +377,7 @@ async def handle_confident_note(text: str, chat_id: int, receipt: str = None, so
 
     # Log acknowledgment to raw_dumps so it appears in web UI
     try:
-        supabase.table('raw_dumps').insert([{
+        user_insert('raw_dumps', {
             "content": ack,
             "status": "processed",
             "is_processed": True,
@@ -384,7 +386,7 @@ async def handle_confident_note(text: str, chat_id: int, receipt: str = None, so
             "message_type": "acknowledgment",
             "source": source,
             "metadata": {"in_response_to": text, "type": "ack"}
-        }]).execute()
+        }).execute()
     except Exception as ack_err:
         audit_log_sync("webhook", "WARNING", f"Failed to log ack to raw_dumps: {ack_err}")
 
@@ -398,13 +400,13 @@ async def handle_clarification(text: str, question: str, chat_id: int, session_i
 
     try:
         await asyncio.to_thread(
-            lambda: supabase.table('raw_dumps').insert([{
+            lambda: user_insert('raw_dumps', {
                 "content": text,
                 "direction": "incoming",
                 "sender": "telegram",
                 "message_type": "clarification",
                 "metadata": {"awaiting_clarification": True}
-            }]).execute()
+            }).execute()
         )
     except Exception as clar_err:
         audit_log_sync("webhook", "WARNING", f"Failed to log clarification to raw_dumps: {clar_err}")
@@ -494,7 +496,7 @@ async def route_by_intent(intent: str, text: str, chat_id: int, session_id: str,
         entity = classification.get('entity') if classification else None
         await handle_confident_note(text, chat_id, receipt or "Note secured.", source=source, sender=sender, entity=entity)
     elif intent == 'DELEGATE':
-        supabase.table('agent_queue').insert({"query": text, "status": "pending"}).execute()
+        user_insert('agent_queue', {"query": text, "status": "pending"}).execute()
         ack = classification.get('receipt', "The intern is on it. I'll ping you when the research is ready.") if classification else "The intern is on it. I'll ping you when the research is ready."
         await send_telegram(chat_id, f"✓ {ack}")
     elif intent == 'DECLARE_PRACTICE':
@@ -513,7 +515,7 @@ async def interrogate_brain(query: str, chat_id: int, session_id: str = None, co
 
         embedding = await asyncio.to_thread(get_embedding, query)
 
-        memories_res = supabase.rpc(
+        memories_res = get_supabase().rpc(
             'match_memories',
             {
                 'query_embedding': embedding,
@@ -535,7 +537,7 @@ async def interrogate_brain(query: str, chat_id: int, session_id: str = None, co
             })
 
         try:
-            canonical_res = supabase.rpc('match_canonical_pages', {
+            canonical_res = get_supabase().rpc('match_canonical_pages', {
                 'query_embedding': embedding,
                 'match_count': 3,
                 'match_threshold': 0.65
@@ -555,7 +557,7 @@ async def interrogate_brain(query: str, chat_id: int, session_id: str = None, co
         combined_results.sort(key=lambda x: x.get('similarity', 0), reverse=True)
 
         try:
-            resources_res = supabase.table('resources').select('title, url, category, summary').execute()
+            resources_res = user_query('resources').select('title, url, category, summary').execute()
             resources = resources_res.data or []
         except:
             resources = []
@@ -565,13 +567,13 @@ async def interrogate_brain(query: str, chat_id: int, session_id: str = None, co
         raw_tasks = []
         proj_map = {}
         try:
-            tasks_res = supabase.table('tasks').select('id, title, priority, project_id, status, reminder_at, created_at').eq('is_current', True).not_.in_('status', ['done', 'cancelled']).order('priority', desc=True).order('created_at', desc=True).execute()
+            tasks_res = user_query('tasks').select('id, title, priority, project_id, status, reminder_at, created_at').eq('is_current', True).not_.in_('status', ['done', 'cancelled']).order('priority', desc=True).order('created_at', desc=True).execute()
             raw_tasks = tasks_res.data or []
             if raw_tasks:
                 proj_ids = list(set(t.get('project_id') for t in raw_tasks if t.get('project_id')))
                 proj_map = {}
                 if proj_ids:
-                    proj_res = supabase.table('projects').select('id, name, org_tag').in_('id', proj_ids).execute()
+                    proj_res = user_query('projects').select('id, name, org_tag').in_('id', proj_ids).execute()
                     for p in (proj_res.data or []):
                         proj_map[p['id']] = p['name']
                 for t in raw_tasks:
@@ -593,13 +595,13 @@ async def interrogate_brain(query: str, chat_id: int, session_id: str = None, co
         recently_completed = []
         try:
             since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-            completed_res = supabase.table('tasks').select('title, priority, project_id, updated_at').eq('is_current', False).eq('status', 'done').gte('updated_at', since).order('updated_at', desc=True).limit(5).execute()
+            completed_res = user_query('tasks').select('title, priority, project_id, updated_at').eq('is_current', False).eq('status', 'done').gte('updated_at', since).order('updated_at', desc=True).limit(5).execute()
             completed_raw = completed_res.data or []
             if completed_raw:
                 done_proj_ids = list(set(t.get('project_id') for t in completed_raw if t.get('project_id')))
                 done_proj_map = {}
                 if done_proj_ids:
-                    done_proj_res = supabase.table('projects').select('id, name').in_('id', done_proj_ids).execute()
+                    done_proj_res = user_query('projects').select('id, name').in_('id', done_proj_ids).execute()
                     for p in (done_proj_res.data or []):
                         done_proj_map[p['id']] = p['name']
                 for t in completed_raw:
@@ -641,11 +643,11 @@ async def interrogate_brain(query: str, chat_id: int, session_id: str = None, co
 
         context_str = "\n\n".join(all_context)
 
-        prompt = f"""You are Danny's Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to Danny's vision. You don't coach or 'motivate.' Speak simply and punchy.
+        prompt = render_prompt(f"""You are {{owner_name}}'s Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to {{owner_name}}'s vision. You don't coach or 'motivate.' Speak simply and punchy.
 
-Danny is asking a question. You have access to his tactical map, memories, active tasks, and resources. Look at the data below, identify what matters — dependencies, blockers — and cut through the noise.
+{{owner_name}} is asking a question. You have access to his tactical map, memories, active tasks, and resources. Look at the data below, identify what matters — dependencies, blockers — and cut through the noise.
 
-Answer only what Danny asked. Do not list unrelated tasks or extra context.
+Answer only what {{owner_name}} asked. Do not list unrelated tasks or extra context.
 {context_str}{conversation_history}
 
 Question: {query}
@@ -654,7 +656,7 @@ Give a sharp, direct answer. If you spot a bottleneck or a pattern, call it out.
 
 Formatting rules:
 - Emoji goes at the **start** of each task line, not at the end
-- Pick emojis naturally: 💰 money, 🏠 home, 📋 admin, 🛠️ work, 🏛️ ashraya/church, etc.
+- Pick emojis naturally based on context: 💰 money, 🏠 home, 📋 admin, etc.
 - Do NOT use `###` headers — use **bold** or just plain text for section breaks
 - Do NOT prefix tasks with "TASK" — just list them cleanly. Do NOT include intent labels like TASK, NOTE, or QUERY anywhere in your response.
 - Bullet points only, no numbered lists
@@ -664,7 +666,7 @@ Example format:
 * 💰 Task name [Project]
 * 📋 Another task [Project]
 
-Always use [MEMORY] or [RESOURCE] brackets when citing — never write MEMORY or RESOURCE without brackets. Preserve the [Project] bracket from the task data exactly as shown."""
+Always use [MEMORY] or [RESOURCE] brackets when citing — never write MEMORY or RESOURCE without brackets. Preserve the [Project] bracket from the task data exactly as shown.""")
 
         response = await call_gemini_with_retry(prompt=prompt, model=CLASSIFICATION_MODEL)
 
@@ -678,7 +680,7 @@ Always use [MEMORY] or [RESOURCE] brackets when citing — never write MEMORY or
 
         # Log QUERY response to raw_dumps so it appears in web UI
         try:
-            supabase.table('raw_dumps').insert([{
+            user_insert('raw_dumps', {
                 "content": answer,
                 "status": "processed",
                 "is_processed": True,
@@ -690,7 +692,7 @@ Always use [MEMORY] or [RESOURCE] brackets when citing — never write MEMORY or
                     "type": "query_response",
                     "query": query
                 }
-            }]).execute()
+            }).execute()
         except Exception as log_err:
             audit_log_sync("webhook", "WARNING", f"Failed to log query response to raw_dumps: {log_err}")
 
@@ -752,7 +754,7 @@ async def handle_declare_practice(text: str, chat_id: int, classification: dict)
             return
 
         # Check for existing practice with similar label (threshold 0.85)
-        existing_res = supabase.table('graph_nodes') \
+        existing_res = user_query('graph_nodes') \
             .select('id, label, metadata') \
             .eq('type', 'practice') \
             .in_('status', ['active', 'dormant']) \
@@ -797,7 +799,7 @@ async def handle_declare_practice(text: str, chat_id: int, classification: dict)
             "health_score_raw": 100
         }
 
-        node_res = supabase.table('graph_nodes').insert({
+        node_res = user_insert('graph_nodes', {
             "label": practice_name,
             "type": "practice",
             "metadata": metadata

@@ -2,14 +2,9 @@ import os
 import json
 import asyncio
 from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
 from core.lib.audit_logger import audit_log_sync
 from core.pulse.llm import call_llm_with_fallback, parse_json_response, get_embedding, cosine_similarity
-
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
+from core.services.db import get_supabase, user_query, user_insert
 
 
 async def detect_practices():
@@ -35,13 +30,13 @@ async def detect_practices():
 
     try:
         # ── Step 0: Initialize core_config key if missing ──
-        supabase.table('core_config').upsert({
+        user_query('core_config').upsert({
             "key": "dismissed_practice_variants",
             "content": "[]"
         }, on_conflict="key").execute()
 
         # ── Step 1: Load exclusion list ──
-        exclusion_res = supabase.table('core_config') \
+        exclusion_res = user_query('core_config') \
             .select('content') \
             .eq('key', 'dismissed_practice_variants') \
             .maybe_single() \
@@ -49,8 +44,8 @@ async def detect_practices():
         exclusion_list = json.loads(exclusion_res.data.get('content', '[]')) if exclusion_res.data else []
 
         # ── Step 2: Load existing practice nodes ──
-        practices_res = supabase.table('graph_nodes') \
-            .select('id, label, metadata') \
+        practices_res = user_query('graph_nodes') \
+            .select('label, metadata') \
             .eq('type', 'practice') \
             .execute()
         existing_practices = practices_res.data or []
@@ -84,7 +79,7 @@ async def detect_practices():
             if not pn['metadata'].get('shortcode'):
                 max_shortcode += 1
                 pn['metadata']['shortcode'] = max_shortcode
-                supabase.table('graph_nodes') \
+                user_query('graph_nodes') \
                     .update({'metadata': pn['metadata']}) \
                     .eq('id', pn['id']) \
                     .execute()
@@ -98,7 +93,7 @@ async def detect_practices():
             all_variant_texts.add(v.lower().strip())
 
         # ── Step 3: Collect candidates from last 14 days ──
-        raw_res = supabase.table('raw_dumps') \
+        raw_res = user_query('raw_dumps') \
             .select('id, content, created_at, metadata, message_type') \
             .gte('created_at', fourteen_days_ago) \
             .in_('message_type', ['task', 'note']) \
@@ -272,7 +267,7 @@ async def detect_practices():
                 meta['frequency_observed'] = f"{meta['occurrence_count']}/{total_days}days"
 
                 # Persist
-                supabase.table('graph_nodes') \
+                user_query('graph_nodes') \
                     .update({'metadata': meta}) \
                     .eq('id', matched_existing['id']) \
                     .execute()
@@ -403,7 +398,7 @@ Return ONLY valid JSON:
                 metadata['typical_days'] = sorted(day_set)
 
                 # Insert node
-                node_res = supabase.table('graph_nodes').insert({
+                node_res = user_insert('graph_nodes', {
                     "label": canonical_name,
                     "type": "practice",
                     "metadata": metadata
@@ -418,13 +413,13 @@ Return ONLY valid JSON:
                     for entity_text in distinct_entities:
                         if not entity_text:
                             continue
-                        entity_node = supabase.table('graph_nodes') \
+                        entity_node = user_query('graph_nodes') \
                             .select('id') \
                             .ilike('label', f'%{entity_text}%') \
                             .limit(1) \
                             .execute()
                         if entity_node.data:
-                            supabase.table('graph_edges').insert({
+                            user_insert('graph_edges', {
                                 "source_node_id": node_id,
                                 "target_node_id": entity_node.data[0]['id'],
                                 "relationship": "ASSOCIATED_WITH",
@@ -464,7 +459,7 @@ Return ONLY valid JSON:
                     variants = meta.get('variants', [])
                     meta['variants'] = variants[:5]
                     meta['_compact_notice'] = f"Compacted from {len(variants)} variants at {now.strftime('%Y-%m-%d')}"
-                    supabase.table('graph_nodes') \
+                    user_query('graph_nodes') \
                         .update({'metadata': meta}) \
                         .eq('id', pn['id']) \
                         .execute()
@@ -476,7 +471,7 @@ Return ONLY valid JSON:
                     if len(variants) > 10:
                         meta['variants'] = variants[:10]
                         meta['_compact_notice'] = f"Compacted from {len(variants)} variants at {now.strftime('%Y-%m-%d')}"
-                    supabase.table('graph_nodes') \
+                    user_query('graph_nodes') \
                         .update({'metadata': meta}) \
                         .eq('id', pn['id']) \
                         .execute()
@@ -507,7 +502,7 @@ async def build_practice_edges():
     on at least 3 co-occurring days.
     """
     try:
-        practices_res = supabase.table('graph_nodes') \
+        practices_res = user_query('graph_nodes') \
             .select('id, label, metadata') \
             .eq('type', 'practice') \
             .execute()
@@ -578,7 +573,7 @@ async def build_practice_edges():
                     continue
 
                 # Check existing edge
-                existing = supabase.table('graph_edges') \
+                existing = user_query('graph_edges') \
                     .select('id') \
                     .eq('source_node_id', a['id']) \
                     .eq('target_node_id', b['id']) \
@@ -601,7 +596,7 @@ async def build_practice_edges():
                     "shared_days": sorted(shared)
                 })
 
-                supabase.table('graph_edges').insert({
+                user_insert('graph_edges', {
                     "source_node_id": a['id'],
                     "target_node_id": b['id'],
                     "relationship": "PRECEDES",
@@ -609,7 +604,7 @@ async def build_practice_edges():
                     "metadata": meta_json
                 }).execute()
 
-                supabase.table('graph_edges').insert({
+                user_insert('graph_edges', {
                     "source_node_id": b['id'],
                     "target_node_id": a['id'],
                     "relationship": "FOLLOWED_BY",
@@ -641,7 +636,7 @@ async def build_practice_correlations() -> list:
     typical_days vs other days over the last 30 days.
     """
     try:
-        completed_res = supabase.table('tasks') \
+        completed_res = user_query('tasks') \
             .select('id', count='exact') \
             .in_('status', ['done', 'cancelled']) \
             .execute()
@@ -649,14 +644,14 @@ async def build_practice_correlations() -> list:
         if total_completed < 50:
             return []
 
-        practices_res = supabase.table('graph_nodes') \
+        practices_res = user_query('graph_nodes') \
             .select('id, label, metadata') \
             .eq('type', 'practice') \
             .execute()
         all_practices = practices_res.data or []
 
         thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        tasks_res = supabase.table('tasks') \
+        tasks_res = user_query('tasks') \
             .select('completed_at') \
             .in_('status', ['done', 'cancelled']) \
             .gte('completed_at', thirty_days_ago) \
@@ -738,7 +733,7 @@ async def sync_practice_canonical_pages():
     is_current=False) matching brain_synth.py conventions.
     """
     try:
-        practices_res = supabase.table('graph_nodes') \
+        practices_res = user_query('graph_nodes') \
             .select('id, label, metadata') \
             .eq('type', 'practice') \
             .execute()
@@ -767,7 +762,7 @@ async def sync_practice_canonical_pages():
             label = p.get('label', '')
             practice_id = p.get('id')
 
-            entities_res = supabase.table('graph_edges') \
+            entities_res = user_query('graph_edges') \
                 .select('target_node_id') \
                 .eq('source_node_id', practice_id) \
                 .eq('relationship', 'ASSOCIATED_WITH') \
@@ -775,7 +770,7 @@ async def sync_practice_canonical_pages():
             entity_ids = [e['target_node_id'] for e in (entities_res.data or [])]
             entity_labels = []
             if entity_ids:
-                e_res = supabase.table('graph_nodes') \
+                e_res = user_query('graph_nodes') \
                     .select('label') \
                     .in_('id', entity_ids) \
                     .execute()
@@ -819,7 +814,7 @@ async def sync_practice_canonical_pages():
             embedding = get_embedding(content)
 
             canonical_title = f"Practice: {label}"
-            existing_res = supabase.table('canonical_pages') \
+            existing_res = user_query('canonical_pages') \
                 .select('id, version') \
                 .eq('title', canonical_title) \
                 .eq('is_current', True) \
@@ -828,7 +823,7 @@ async def sync_practice_canonical_pages():
 
             if existing:
                 old_ver = existing.get('version', 0) or 0
-                supabase.table('canonical_pages').insert({
+                user_insert('canonical_pages', {
                     "title": canonical_title,
                     "project_id": None,
                     "content": content,
@@ -841,12 +836,12 @@ async def sync_practice_canonical_pages():
                     "last_synth_at": now_iso,
                     "is_sparse": len(content) < 500
                 }).execute()
-                supabase.table('canonical_pages') \
+                user_query('canonical_pages') \
                     .update({"is_current": False}) \
                     .eq('id', existing['id']) \
                     .execute()
             else:
-                supabase.table('canonical_pages').insert({
+                user_insert('canonical_pages', {
                     "title": canonical_title,
                     "project_id": None,
                     "content": content,
@@ -882,8 +877,8 @@ async def build_rhythms_section(new_practice_labels: list = None, new_practice_i
     """
     try:
         # Query all practice nodes
-        practices_res = supabase.table('graph_nodes') \
-            .select('label, metadata') \
+        practices_res = user_query('graph_nodes') \
+            .select('id, label, metadata') \
             .eq('type', 'practice') \
             .execute()
         all_practices = practices_res.data or []

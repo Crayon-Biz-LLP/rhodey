@@ -3,19 +3,21 @@ import re
 import asyncio
 import json
 from datetime import datetime, timezone, timedelta
-from google import genai
-from supabase import create_client, Client
 from core.lib.rate_limiter import flash_lite_limiter
 from core.lib.audit_logger import audit_log_sync
+from core.services.db import user_query, user_insert, get_supabase
+from core.lib.prompt_template import render_prompt
 
 
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
+_gemini_client = None
 
 
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
+        _gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    return _gemini_client
 
 EMBEDDING_MODEL = "gemini-embedding-2-preview"
 
@@ -37,13 +39,13 @@ async def call_gemini_with_retry(prompt: str, model: str = None, config: dict = 
             if "flash-lite" in model:
                 await flash_lite_limiter.acquire_async()
             if contents is not None:
-                response = gemini_client.models.generate_content(
+                response = _get_gemini_client().models.generate_content(
                     model=model,
                     contents=contents,
                     config=config or {}
                 )
             else:
-                response = gemini_client.models.generate_content(
+                response = _get_gemini_client().models.generate_content(
                     model=model,
                     contents=prompt,
                     config=config or {}
@@ -64,7 +66,7 @@ async def call_gemini_with_retry(prompt: str, model: str = None, config: dict = 
 def get_embedding(text: str) -> list:
     try:
         # 🎯 Force the model to return 768 dimensions to match Supabase
-        result = gemini_client.models.embed_content(
+        result = _get_gemini_client().models.embed_content(
             model=EMBEDDING_MODEL,
             contents=text,
             config={
@@ -92,9 +94,9 @@ async def classify_intent(text: str, context: list, ist_hour: int = None, core_j
     if context:
         context_str = f"\n\nPrevious messages for context:\n" + "\n".join([f"- {c['content']}" for c in context])
 
-    prompt = f"""You are Danny's Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to Danny's vision. You don't coach or 'motivate.' Speak simply and punchy. If it's after 9 PM, append a dry command to sign off (e.g., 'Go be a dad').
+    prompt = render_prompt(f"""You are {{owner_name}}'s Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to {{owner_name}}'s vision. You don't coach or 'motivate.' Speak simply and punchy. If it's after 9 PM, append a dry command to sign off (e.g., 'Go be a dad').
 
-    PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm Danny's task is SECURED in his system.
+    PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm {{owner_name}}'s task is SECURED in his system.
 
     Message: "{text}"{context_str}{conversation_history}
     CURRENT TIME CONTEXT: It's the {time_phase}.
@@ -104,7 +106,7 @@ async def classify_intent(text: str, context: list, ist_hour: int = None, core_j
     {{
         "intent": "TASK|NOTE|NOISE|CLARIFICATION_NEEDED|DELEGATE|QUERY|DECLARE_PRACTICE|DAILY_BRIEF",
         "confidence": 0.0-1.0,
-        "entity": "SOLVSTRAT|QHORD|PERSONAL|ASHRAYA|INBOX",
+        "entity": "{{entity_list}}",
         "title": "extracted task title",
         "time_context": "time info if any",
         "clarification_question": "question if needed",
@@ -114,27 +116,27 @@ async def classify_intent(text: str, context: list, ist_hour: int = None, core_j
     }}
 
     Rules:
-    - STRICT TITLE FIDELITY: The title field must be a literal extraction of the task as spoken. NEVER add project names, infer entities, or change Danny's wording (e.g., if he says "this OS," do NOT change it to "Qhord OS").
-    - PROJECT ROUTING: Route tasks about personal finances, bills, home, or family to PERSONAL. Route Ashraya church administration, operations, accounts to ASHRAYA. Route personal spiritual practices (bible reading, prayer, volunteering) to PERSONAL. Only route to CRAYON if it relates to corporate governance, business taxes, or legal compliance. Route tech/client work to SOLVSTRAT.
-    - STATUS vs TASK: If a message describes something that HAS HAPPENED (e.g., 'Lead generated', 'Meeting finished', 'Sent the file'), classify it as a NOTE. A TASK must imply an OUTSTANDING action for Danny to perform (e.g., 'Call the lead', 'Prepare the ERP plan'). If it's a win or a milestone, it's a NOTE for the Historian.
+    - STRICT TITLE FIDELITY: The title field must be a literal extraction of the task as spoken. NEVER add project names, infer entities, or change {{owner_name}}'s wording (e.g., if he says "this OS," do NOT change it to "Qhord OS").
+    - PROJECT ROUTING: {{project_routing}} Route to {{company_name}} only for company governance, legal, or tax matters.
+    - STATUS vs TASK: If a message describes something that HAS HAPPENED (e.g., 'Lead generated', 'Meeting finished', 'Sent the file'), classify it as a NOTE. A TASK must imply an OUTSTANDING action for {{owner_name}} to perform (e.g., 'Call the lead', 'Prepare the ERP plan'). If it's a win or a milestone, it's a NOTE for the Historian.
     - TASK: Any message that implies an action. Do not require a date or time.
     - NOTE: Ideas, insights, or learnings worth remembering.
     - QUERY: The user is asking a question to retrieve information from their past notes, tasks, or the vault (e.g., "What did the analyst say?", "When is my meeting?").
     - DISAMBIGUATION: If confidence < 0.8 and you're torn between multiple intents, list alternatives in "possible_intents". For example, if a message could be either a QUERY or a TASK, set intent to your best guess and possible_intents to ["TASK", "QUERY"]. Leave as an empty array if you're confident.
-    - CONVERSATION HISTORY: Use the CONVERSATION HISTORY block above to disambiguate vague follow-ups. If Danny says "what about tomorrow?" after having just asked about today, route as DAILY_BRIEF. If he says "reschedule the 2pm" after discussing calendar, route as TASK. The history tells you what the current topic is.
+    - CONVERSATION HISTORY: Use the CONVERSATION HISTORY block above to disambiguate vague follow-ups. If {{owner_name}} says "what about tomorrow?" after having just asked about today, route as DAILY_BRIEF. If he says "reschedule the 2pm" after discussing calendar, route as TASK. The history tells you what the current topic is.
     - DELEGATE: Research, competitor audits, or autonomous web research.
-    - DECLARE_PRACTICE: If Danny says "I want to [activity] every [timeframe]", "I'm going to start [activity]", "Track [activity] for me", "I want to build a practice of [activity]", or expresses intent to establish a recurring behavior — classify as DECLARE_PRACTICE. Extract the practice name into the title field. Route to the most relevant entity (PERSONAL for health/personal routines, SOLVSTRAT for work practices, etc.).
-    - DAILY_BRIEF: Danny is asking about today's schedule, calendar, or what's on his plate. Examples: "what's today?", "what's on my calendar?", "what do I have today?", "give me my day", "what's happening today?". Extract into title: "Daily Briefing". Entity: INBOX.
+    - DECLARE_PRACTICE: If {{owner_name}} says "I want to [activity] every [timeframe]", "I'm going to start [activity]", "Track [activity] for me", "I want to build a practice of [activity]", or expresses intent to establish a recurring behavior — classify as DECLARE_PRACTICE. Extract the practice name into the title field. Route to the most relevant entity based on {{project_routing}}.
+    - DAILY_BRIEF: {{owner_name}} is asking about today's schedule, calendar, or what's on his plate. Examples: "what's today?", "what's on my calendar?", "what do I have today?", "give me my day", "what's happening today?". Extract into title: "Daily Briefing". Entity: INBOX.
     - RECEIPT RULE: Receipts must be confirmation-only. Use: '[Subject] logged for [Time/Day].'
-    - LITERAL SUBJECT RULE: Mirror Danny's verb. (e.g., 'Check with Vasanth' → 'Vasanth check-in logged').
+    - LITERAL SUBJECT RULE: Mirror {{owner_name}}'s verb. (e.g., 'Check with Vasanth' → 'Vasanth check-in logged').
     - ZERO DATA LOSS: Never drop qualifiers like 'Canadian project' or 'Zoho API'.
-    - STEALTH ROUTING: Assign the entity in the JSON, but NEVER mention it (SOLVSTRAT, PERSONAL) in the receipt text.
+    - STEALTH ROUTING: {{stealth_routing}}
     - DATE HANDSHAKE: If a time or day is mentioned, include it in the receipt for verification.
     - If it's night (Phase: night), confirm the entry first, THEN give the sign-off command. (e.g., 'Vasanth check-in logged. Now go be a dad.').
     - TONE GUARD: NEVER use: 'momentum', 'focus', 'gentle', 'reflection', 'push', 'strategic', 'SITREP', 'optimal', 'mission', 'ready for your review'.
-    - PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm Danny's task is SECURED in his system.
-    - STRATEGIC CORRECTIONS: If Danny starts a message with 'Record this for the Vault', 'Correction for the Historian', or 'Correction of Record', classify it immediately as a NOTE with 1.0 confidence. These are manual strategic overrides and must never be ignored.
-    - META-SYSTEM CONTENT: Allow content that talks about 'Atna', 'Solvstrat', or 'Qhord' even if the message is long or complex. These are high-value strategic inputs."""
+    - PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm {{owner_name}}'s task is SECURED in his system.
+    - STRATEGIC CORRECTIONS: If {{owner_name}} starts a message with 'Record this for the Vault', 'Correction for the Historian', or 'Correction of Record', classify it immediately as a NOTE with 1.0 confidence. These are manual strategic overrides and must never be ignored.
+    - META-SYSTEM CONTENT: Allow content that references your domains or projects even if the message is long or complex. These are high-value strategic inputs.""")
 
     try:
         response = await call_gemini_with_retry(
@@ -182,7 +184,7 @@ def check_task_overlap_for_update(text: str) -> list:
             return []
         active_keywords = keywords[:3]
 
-        tasks_res = supabase.table('tasks')\
+        tasks_res = user_query('tasks')\
             .select('id, title')\
             .eq('is_current', True)\
             .not_.in_('status', ['done', 'cancelled'])\

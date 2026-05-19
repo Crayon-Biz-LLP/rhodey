@@ -1,33 +1,31 @@
 """
 Audit Logger - Replaces print() with permanent audit trail.
 Writes to Supabase audit_logs table for observability.
+Lazy-init: the Supabase client is NOT created at import time.
 """
 import os
 import json
 import traceback
 from datetime import datetime, timezone
-from supabase import create_client, Client
-from dotenv import load_dotenv
 
-# Load env on import
-dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
-load_dotenv(dotenv_path)
+_supabase = None
 
-supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-supabase: Client = create_client(supabase_url, supabase_key)
+
+def _get_supabase():
+    global _supabase
+    if _supabase is None:
+        from supabase import create_client
+        from dotenv import load_dotenv
+        dotenv_path = os.path.join(os.path.dirname(__file__), '..', '..', '.env')
+        load_dotenv(dotenv_path)
+        _supabase = create_client(
+            os.getenv("SUPABASE_URL"),
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        )
+    return _supabase
 
 
 async def audit_log(service: str, level: str, message: str, metadata: dict = None):
-    """
-    Write an audit log entry to Supabase audit_logs table.
-    
-    Args:
-        service: 'pulse', 'webhook', 'backfill_graph', etc.
-        level: 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
-        message: Log message (truncated to 500 chars)
-        metadata: Additional context (error stack, memory_id, etc.)
-    """
     try:
         log_data = {
             "service": service,
@@ -35,17 +33,12 @@ async def audit_log(service: str, level: str, message: str, metadata: dict = Non
             "message": message[:500] if message else "(empty)",
             "metadata": json.dumps(metadata or {})
         }
-        supabase.table('audit_logs').insert(log_data).execute()
+        _get_supabase().table('audit_logs').insert(log_data).execute()
     except Exception as e:
-        # Fallback to print if audit_logs write fails
         print(f"⚠️ AUDIT LOG FAILURE: {e} | Original: [{service}] {level}: {message}")
 
 
 def audit_log_sync(service: str, level: str, message: str, metadata: dict = None):
-    """
-    Synchronous version of audit_log.
-    Use in non-async contexts (e.g., webhook.py).
-    """
     try:
         log_data = {
             "service": service,
@@ -53,7 +46,7 @@ def audit_log_sync(service: str, level: str, message: str, metadata: dict = None
             "message": message[:500] if message else "(empty)",
             "metadata": json.dumps(metadata or {})
         }
-        supabase.table('audit_logs').insert(log_data).execute()
+        _get_supabase().table('audit_logs').insert(log_data).execute()
     except Exception as e:
         print(f"⚠️ AUDIT LOG FAILURE: {e} | Original: [{service}] {level}: {message}")
 

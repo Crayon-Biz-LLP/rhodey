@@ -1,18 +1,13 @@
 import os
 from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.discovery_cache import base
 from core.lib.audit_logger import audit_log_sync
+from core.services.db import get_supabase, user_query, user_insert
 from core.services.google_service import get_google_creds, format_rfc3339
 from core.lib.temporal_lineage import create_versioned_task
 from core.services.outlook_service import get_outlook_calendar_events, get_outlook_calendar_events_range
-
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
 
 
 class MemoryCache(base.Cache):
@@ -130,7 +125,7 @@ def sync_completed_tasks_from_google(supabase_client, tasks_service):
                 if google_task.get('status') == 'completed':
                     # Versioned insert for task completion
                     try:
-                        current = supabase.table('tasks').select('*').eq('id', task_id).execute()
+                        current = user_query('tasks').select('*').eq('id', task_id).execute()
                         if current.data:
                             old_task = current.data[0]
                             new_payload = {
@@ -146,7 +141,7 @@ def sync_completed_tasks_from_google(supabase_client, tasks_service):
                             )
                     except Exception as ve:
                         # Fallback to direct update
-                        supabase.table('tasks').update({
+                        user_query('tasks').update({
                             'status': 'done',
                             'completed_at': datetime.now(timezone.utc).isoformat()
                         }).eq('id', task_id).execute()

@@ -1,4 +1,4 @@
-name: Pulse Engine (Rhodey SITREP)
+name: Pulse Engine (Rhodey)
 on:
   schedule:
     - cron: '30 23 * * 1-5'
@@ -22,9 +22,8 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
-          for secret in "$SUPABASE_URL" "$SUPABASE_SERVICE_ROLE_KEY" "$GEMINI_API_KEY" "$TELEGRAM_BOT_TOKEN" "$GOOGLE_REFRESH_TOKEN"; do
+          for secret in "$SUPABASE_URL" "$SUPABASE_SERVICE_ROLE_KEY" "$GEMINI_API_KEY" "$TELEGRAM_BOT_TOKEN"; do
             if [ -z "$secret" ]; then
               echo "❌ One or more required secrets are missing"
               exit 1
@@ -40,25 +39,14 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
-      - name: "Step 1: Ingest New Journal Entries"
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python -m core.skills.archive_ingest
-
-      - name: "Step 2: Update Neural Graph (Link Memories)"
+      - name: "Step 1: Update Neural Graph (Link Memories)"
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python -m core.skills.backfill_graph
 
-      - name: "Step 3: Execute Rhodey SITREP (The Briefing)"
+      - name: "Step 2: Execute Briefing (Pulse)"
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -68,13 +56,7 @@ jobs:
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           PULSE_SECRET: ${{ secrets.PULSE_SECRET }}
-          OUTLOOK_CLIENT_ID: ${{ secrets.OUTLOOK_CLIENT_ID }}
-          OUTLOOK_CLIENT_SECRET: ${{ secrets.OUTLOOK_CLIENT_SECRET }}
-          OUTLOOK_REFRESH_TOKEN: ${{ secrets.OUTLOOK_REFRESH_TOKEN }}
-          OUTLOOK_TENANT_ID: ${{ secrets.OUTLOOK_TENANT_ID }}
-          OUTLOOK_SCOPES: ${{ secrets.OUTLOOK_SCOPES }}
         run: python -m core.pulse_cli
 
   notify_failure:
@@ -84,5 +66,5 @@ jobs:
     steps:
       - name: Notify on failure
         run: |
-          echo "⚠️ Rhodey SITREP FAILED at $(date)"
-          echo "Check logs: https://github.com/Crayon-Biz-LLP/integrated-os/actions"
+          echo "⚠️ Rhodey Pulse failed at $(date)"
+          echo "Check logs: https://github.com/${{ github.repository }}/actions"

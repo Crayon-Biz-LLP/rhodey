@@ -2,13 +2,8 @@
 Temporal Lineage - Version history for memories, tasks, projects.
 Enables tracking how thoughts/decisions evolve over time.
 """
-import os
 from datetime import datetime, timezone
-from supabase import create_client, Client
-
-supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-supabase: Client = create_client(supabase_url, supabase_key)
+from core.services.db import user_query, user_insert, get_supabase
 
 
 def create_versioned_memory(
@@ -36,13 +31,13 @@ def create_versioned_memory(
     # Get next version number if updating existing
     version = 1
     if old_memory_id:
-        old = supabase.table("memories").select("version").eq("id", old_memory_id).execute()
+        old = user_query("memories").select("version").eq("id", old_memory_id).execute()
         if old.data:
             version = (old.data[0].get("version", 0) or 0) + 1
     
     # Mark old memory as not current
     if old_memory_id:
-        supabase.table("memories").update({
+        user_query("memories").update({
             "is_current": False
         }).eq("id", old_memory_id).execute()
     
@@ -59,7 +54,7 @@ def create_versioned_memory(
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
-    result = supabase.table("memories").insert(new_memory).execute()
+    result = user_insert("memories", new_memory).execute()
     return result.data[0] if result.data else None
 
 
@@ -84,7 +79,7 @@ def create_versioned_task(
     # Get next version number
     version = 1
     if old_task_id:
-        old = supabase.table("tasks").select("version").eq("id", old_task_id).execute()
+        old = user_query("tasks").select("version").eq("id", old_task_id).execute()
         if old.data:
             version = (old.data[0].get("version", 0) or 0) + 1
     
@@ -99,11 +94,11 @@ def create_versioned_task(
     }
     
     # Insert new version FIRST (so failure doesn't orphan the old record)
-    result = supabase.table("tasks").insert(new_task).execute()
+    result = user_insert("tasks", new_task).execute()
     
     # Mark old task as not current (only after new insert succeeds)
     if old_task_id:
-        supabase.table("tasks").update({
+        user_query("tasks").update({
             "is_current": False
         }).eq("id", old_task_id).execute()
     
@@ -131,13 +126,13 @@ def create_versioned_project(
     # Get next version number
     version = 1
     if old_project_id:
-        old = supabase.table("projects").select("version").eq("id", old_project_id).execute()
+        old = user_query("projects").select("version").eq("id", old_project_id).execute()
         if old.data:
             version = (old.data[0].get("version", 0) or 0) + 1
     
     # Mark old project as not current
     if old_project_id:
-        supabase.table("projects").update({
+        user_query("projects").update({
             "is_current": False
         }).eq("id", old_project_id).execute()
     
@@ -151,7 +146,7 @@ def create_versioned_project(
         **kwargs
     }
     
-    result = supabase.table("projects").insert(new_project).execute()
+    result = user_insert("projects", new_project).execute()
     return result.data[0] if result.data else None
 
 
@@ -167,7 +162,7 @@ def get_memory_history(memory_id: int) -> list:
     
     # Walk the supersedes chain backward
     while current_id:
-        mem = supabase.table("memories").select("*").eq("id", current_id).execute()
+        mem = user_query("memories").select("*").eq("id", current_id).execute()
         if not mem.data:
             break
         history.insert(0, mem.data[0])  # Insert at beginning (oldest first)
@@ -183,7 +178,7 @@ def detect_drift(project_name: str, hours_window: int = 48) -> dict:
     Returns:
         Dict with update_count, first_update, last_update
     """
-    result = supabase.rpc("detect_drift", {
+    result = get_supabase().rpc("detect_drift", {
         "project_name": project_name,
         "hours_window": hours_window
     }).execute()
@@ -210,7 +205,7 @@ def get_state_at_time(table_name: str, record_id: int, query_time: str) -> dict:
         The record state at that time
     """
     # Query for the version that was current at query_time
-    result = supabase.table(table_name) \
+    result = user_query(table_name) \
         .select("*") \
         .eq("id", record_id) \
         .lte("created_at", query_time) \
@@ -222,7 +217,7 @@ def get_state_at_time(table_name: str, record_id: int, query_time: str) -> dict:
         return result.data[0]
     
     # If not found by ID, check supersedes chain
-    result = supabase.table(table_name) \
+    result = user_query(table_name) \
         .select("*") \
         .eq("supersedes_id", record_id) \
         .lte("created_at", query_time) \

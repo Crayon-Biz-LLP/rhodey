@@ -3,18 +3,18 @@ import json
 import asyncio
 import re as _re
 from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
 from core.lib.audit_logger import audit_log_sync
 from core.webhook.telegram import send_telegram
 from core.webhook.classify import get_embedding
-from core.webhook.utils import supabase, trigger_github_pulse
+from core.webhook.utils import trigger_github_pulse
 from core.webhook.email import handle_ed_command
+from core.services.db import user_query, user_insert, get_supabase
 
 
 async def handle_practices_command(chat_id: int):
     """Query and display all practice nodes grouped by status."""
     try:
-        practices_res = supabase.table('graph_nodes') \
+        practices_res = user_query('graph_nodes') \
             .select('id, label, metadata') \
             .eq('type', 'practice') \
             .execute()
@@ -124,7 +124,7 @@ async def handle_status_command(chat_id: int):
         stale_cutoff = (now - timedelta(days=7)).isoformat()
 
         # Urgent tasks
-        urgent_res = supabase.table('tasks')\
+        urgent_res = user_query('tasks')\
             .select('id', count='exact')\
             .eq('priority', 'urgent')\
             .in_('status', ['todo', 'in_progress'])\
@@ -132,7 +132,7 @@ async def handle_status_command(chat_id: int):
         urgent_count = urgent_res.count or 0
 
         # Important tasks
-        important_res = supabase.table('tasks')\
+        important_res = user_query('tasks')\
             .select('id', count='exact')\
             .eq('priority', 'important')\
             .in_('status', ['todo', 'in_progress'])\
@@ -140,7 +140,7 @@ async def handle_status_command(chat_id: int):
         important_count = important_res.count or 0
 
         # Stale tasks (no update in 7+ days, still open)
-        stale_res = supabase.table('tasks')\
+        stale_res = user_query('tasks')\
             .select('id', count='exact')\
             .in_('status', ['todo', 'in_progress'])\
             .lt('updated_at', stale_cutoff)\
@@ -148,28 +148,28 @@ async def handle_status_command(chat_id: int):
         stale_count = stale_res.count or 0
 
         # Pending email decisions
-        pending_email_res = supabase.table('email_pending_tasks')\
+        pending_email_res = user_query('email_pending_tasks')\
             .select('id', count='exact')\
-            .is_('danny_decision', 'null')\
+            .is_('user_decision', 'null')\
             .execute()
         pending_email_count = pending_email_res.count or 0
 
         # Pending drafts
-        pending_drafts_res = supabase.table('email_drafts')\
+        pending_drafts_res = user_query('email_drafts')\
             .select('id', count='exact')\
             .eq('status', 'pending')\
             .execute()
         pending_drafts_count = pending_drafts_res.count or 0
 
         # Unprocessed raw dumps
-        raw_dumps_res = supabase.table('raw_dumps')\
+        raw_dumps_res = user_query('raw_dumps')\
             .select('id', count='exact')\
             .in_('status', ['pending', 'staged'])\
             .execute()
         raw_dumps_count = raw_dumps_res.count or 0
 
         # Agent queue (pending research tasks)
-        agent_res = supabase.table('agent_queue')\
+        agent_res = user_query('agent_queue')\
             .select('id', count='exact')\
             .eq('status', 'pending')\
             .execute()
@@ -204,7 +204,7 @@ async def handle_undo_command(text: str, chat_id: int):
     # Bare /undo → show most recent entry
     if text.strip() == '/undo':
         try:
-            recent = supabase.table('raw_dumps') \
+            recent = user_query('raw_dumps') \
                 .select('id, content, message_type, status, created_at') \
                 .eq('direction', 'incoming') \
                 .eq('sender', 'user') \
@@ -249,7 +249,7 @@ async def handle_undo_command(text: str, chat_id: int):
 
     # Fetch the most recent entry
     try:
-        recent = supabase.table('raw_dumps') \
+        recent = user_query('raw_dumps') \
             .select('id, content, message_type, status') \
             .eq('direction', 'incoming') \
             .eq('sender', 'user') \
@@ -270,13 +270,13 @@ async def handle_undo_command(text: str, chat_id: int):
         current_status = r.get('status', '')
 
         if undo_d:
-            supabase.table('raw_dumps').update({
+            user_query('raw_dumps').update({
                 "status": "cancelled",
                 "is_processed": True,
             }).eq('id', dump_id).execute()
             # Best-effort cancel any task Pulse may have created
             try:
-                supabase.table('tasks').update({"status": "cancelled"}) \
+                user_query('tasks').update({"status": "cancelled"}) \
                     .ilike('title', content[:100]) \
                     .in_('status', ['todo', 'in_progress']) \
                     .execute()
@@ -286,7 +286,7 @@ async def handle_undo_command(text: str, chat_id: int):
             return {"success": True}
 
         if undo_n:
-            supabase.table('raw_dumps').update({
+            user_query('raw_dumps').update({
                 "message_type": "note",
                 "status": "staged",
             }).eq('id', dump_id).execute()
@@ -294,14 +294,14 @@ async def handle_undo_command(text: str, chat_id: int):
             embedding = await asyncio.to_thread(get_embedding, content)
             if embedding and any(embedding):
                 try:
-                    supabase.table('memories').insert({
+                    user_insert('memories', {
                         "content": content,
                         "memory_type": "note",
                         "embedding": embedding,
                         "embedding_status": "success",
                         "source": "webhook_undo"
                     }).execute()
-                    supabase.table('raw_dumps').update({
+                    user_query('raw_dumps').update({
                         "status": "processed",
                         "is_processed": True,
                     }).eq('id', dump_id).execute()
@@ -309,7 +309,7 @@ async def handle_undo_command(text: str, chat_id: int):
                     pass
             # Best-effort cancel any task Pulse may have created
             try:
-                supabase.table('tasks').update({"status": "cancelled"}) \
+                user_query('tasks').update({"status": "cancelled"}) \
                     .ilike('title', content[:100]) \
                     .in_('status', ['todo', 'in_progress']) \
                     .execute()
@@ -319,13 +319,13 @@ async def handle_undo_command(text: str, chat_id: int):
             return {"success": True}
 
         if undo_t:
-            supabase.table('raw_dumps').update({
+            user_query('raw_dumps').update({
                 "message_type": "task",
                 "status": "pending",
             }).eq('id', dump_id).execute()
             # If it was in memories, remove it
             try:
-                supabase.table('memories').delete() \
+                user_query('memories').delete() \
                     .eq('content', content) \
                     .eq('source', 'webhook_undo') \
                     .execute()
@@ -345,7 +345,7 @@ async def handle_command(text: str, chat_id: int):
     if text.startswith('/mission') or text == '🚀 Mission':
         params = text.replace('/mission', '').replace('🚀 Mission', '').strip()
         if not params:
-            m_res = supabase.table('graph_nodes').select('label').eq('type', 'mission').execute()
+            m_res = user_query('graph_nodes').select('label').eq('type', 'mission').execute()
             active_missions = [m for m in (m_res.data or []) if json.loads(m.get('metadata', '{}')).get('status') == 'active']
             if active_missions:
                 m_list = "\n".join([f"• {m['label']}" for m in active_missions])
@@ -355,7 +355,7 @@ async def handle_command(text: str, chat_id: int):
         else:
             try:
                 existing_mission = (
-                    supabase.table('graph_nodes')
+                    user_query('graph_nodes')
                     .select('id')
                     .eq('type', 'mission')
                     .ilike('label', params)
@@ -365,7 +365,7 @@ async def handle_command(text: str, chat_id: int):
                 if existing_mission.data:
                     reply = f"⚠️ Mission '{params}' already exists. Type `/mission [different goal]` to start a new one."
                 else:
-                    supabase.table('graph_nodes').insert({
+                    user_insert('graph_nodes', {
                         "label": params,
                         "type": "mission",
                         "metadata": {"status": "active", "origin": "webhook_command"}
@@ -375,7 +375,7 @@ async def handle_command(text: str, chat_id: int):
                 reply = f"❌ Error: {str(e)}"
 
     elif text in ['/library', '📚 Library']:
-        lib_res = supabase.table('resources').select('title, url, category').order('created_at', desc=True).limit(10).execute()
+        lib_res = user_query('resources').select('title, url, category').order('created_at', desc=True).limit(10).execute()
         items = lib_res.data or []
         if items:
             formatted = [f"🔖 **[{i.get('title') or 'Untitled'}]({i.get('url')})**" for i in items]
@@ -390,7 +390,7 @@ async def handle_command(text: str, chat_id: int):
     elif text.startswith('/season') or text == '🧭 Season Context':
         params = text.replace('/season', '').replace('🧭 Season Context', '').strip()
         if not params:
-            season_res = supabase.table('core_config').select('content').eq('key', 'current_season').limit(1).execute()
+            season_res = get_supabase().table('core_config').select('content').eq('key', 'current_season').limit(1).execute()
             if season_res.data:
                 reply = f"🧭 **CURRENT NORTH STAR:**\n\n{season_res.data[0]['content']}"
             else:
@@ -400,7 +400,7 @@ async def handle_command(text: str, chat_id: int):
                 reply = "❌ **Error:** Definition too short."
             else:
                 try:
-                    supabase.table('core_config').update({"content": params}).eq('key', 'current_season').execute()
+                    get_supabase().table('core_config').update({"content": params}).eq('key', 'current_season').execute()
                     reply = "✅ **Season Updated.**\nTarget Locked."
                 except:
                     reply = "❌ Database Error"
@@ -408,7 +408,7 @@ async def handle_command(text: str, chat_id: int):
     elif text in ['/urgent', '🔴 Urgent']:
         now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
         now_iso = now_ist.strftime('%Y-%m-%dT%H:%M:%S+05:30')
-        fire_res = supabase.table('tasks').select('*').eq('priority', 'urgent').eq('status', 'todo').eq('is_current', True).or_(f"reminder_at.is.null,reminder_at.lte.{now_iso}").limit(1).execute()
+        fire_res = user_query('tasks').select('*').eq('priority', 'urgent').eq('status', 'todo').eq('is_current', True).or_(f"reminder_at.is.null,reminder_at.lte.{now_iso}").limit(1).execute()
         if fire_res.data:
             fire = fire_res.data[0]
             reply = f"🔴 **ACTION REQUIRED:**\n\n🔥 {fire.get('title')}\n⏱️ Est: {fire.get('estimated_minutes')} mins"
@@ -432,9 +432,9 @@ async def handle_command(text: str, chat_id: int):
 
     elif text in ['/ep']:
         try:
-            pending = supabase.table('email_pending_tasks')\
+            pending = user_query('email_pending_tasks')\
                 .select('id, suggested_title, suggested_project, possible_duplicate, duplicate_of_title')\
-                .is_('danny_decision', 'null')\
+                .is_('user_decision', 'null')\
                 .order('created_at', desc=False)\
                 .limit(10)\
                 .execute()

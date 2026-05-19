@@ -7,16 +7,16 @@ from datetime import datetime, timedelta, timezone
 
 from core.lib.constants import EmailStatus
 from core.lib.duplicate_guard import check_duplicate
-from core.services.db import get_supabase, get_embedding
+from core.services.db import user_query, user_insert, get_supabase, get_embedding
 from core.services.llm import call_gemini_classify, get_gemini_client
+from core.lib.prompt_template import render_prompt
 import requests
 
-supabase = get_supabase()
 
 def build_active_task_list() -> list:
     """Fetch all active task titles ONCE for duplicate checking."""
     try:
-        result = supabase.table('tasks')\
+        result = user_query('tasks')\
             .select('id, title')\
             .not_.in_('status', ['done', 'cancelled'])\
             .execute()
@@ -74,12 +74,12 @@ def parse_json_response(response_text: str) -> any:
     raise ValueError(f"Could not parse JSON from response: {text[:100]}...")
 
 async def generate_draft(sender: str, subject: str, body: str) -> str:
-    prompt = f"""You are drafting a professional reply on behalf of Danny (Yashwant Daniel), founder of Crayon. Write a concise, warm, and direct reply to this email. Do not sign off with a full signature block — end with just 'Danny'. Do not send — this is a draft for Danny's review.
+    prompt = render_prompt(f"""You are drafting a professional reply on behalf of {{owner_name}} ({{owner_full_name}}), founder of {{company_name}}. Write a concise, warm, and direct reply to this email. Do not sign off with a full signature block — end with just '{{owner_name}}'. Do not send — this is a draft for {{owner_name}}'s review.
 
 Sender: {sender}
 Subject: {subject}
 Body:
-{body[:1000]}"""
+{body[:1000]}""")
 
     try:
         response = await call_gemini_with_retry(prompt, model="gemini-3.1-flash-lite-preview")
@@ -92,16 +92,15 @@ Body:
 
 
 async def classify_email(sender: str, subject: str, body: str, to_header: str = '', cc_header: str = '') -> dict:
-    prompt = f"""You are classifying an email for Danny (Yashwant Daniel), founder of Crayon, Chennai, India.
+    prompt = render_prompt(f"""You are classifying an email for {{owner_name}} ({{owner_full_name}}), founder of {{company_name}}, {{location}}.
 
-MAILBOX CONTEXT: This is Danny's WORK Outlook inbox. It receives exclusively work-related emails. Personal and church emails do NOT arrive here.
+MAILBOX CONTEXT: This is {{owner_name}}'s WORK Outlook inbox. It receives exclusively work-related emails. Personal emails do NOT arrive here.
 
 What legitimately arrives here:
 - Clients: briefs, feedback, approvals, project questions
 - Vendors: quotes, invoices (human-sent), delivery confirmations requiring action
 - Team: employees, contractors, freelancers, collaborators
 - Business partners: legal, CA, compliance, banking (human-sent)
-- Business entities: Crayon, Solvstrat, Product Labs, Qhord.
 
 Sender: {sender}
 To: {to_header}
@@ -120,14 +119,14 @@ CLASSIFY AS "ignored" IF ANY of these are true:
 - It is a payment receipt, invoice auto-confirmation, or automated billing notification
 
 CLASSIFY AS "fyi" IF:
-- Danny is in CC or BCC
+- {{owner_name}} is in CC or BCC
 - A team member or partner is sharing a status update, report, or information that needs no response
-- It is a human-sent update where no action is required from Danny specifically
+- It is a human-sent update where no action is required from {{owner_name}} specifically
 
 CLASSIFY AS "actionable" IF:
-- Addressed directly To: Danny
+- Addressed directly To: {{owner_name}}
 - From a real individual (client, vendor, team member, CA, lawyer, partner, contractor)
-- Requires Danny to respond, approve, review, decide, schedule, or fulfill a business obligation
+- Requires {{owner_name}} to respond, approve, review, decide, schedule, or fulfill a business obligation
 - Bias toward actionable for client and vendor emails — when in doubt, surface it
 
 ─── OUTPUT RULES ───
@@ -138,7 +137,7 @@ suggested_task:
 - NULL if action is too vague to state specifically
 
 needs_draft:
-- true if Danny needs to write a reply
+- true if {{owner_name}} needs to write a reply
 - true if is_human_sender = true AND the sender is waiting for acknowledgement,
   confirmation, or an update — even if the task itself is an offline action
 - false ONLY if the task is a call, meeting, or internal action where 
@@ -154,7 +153,7 @@ has_memory_value:
 - Can only be true if is_human_sender is also true
 
 Return ONLY valid JSON, NO markdown, NO explanation:
-{{
+{{{{
   "classification": "ignored|fyi|actionable",
   "summary": "2 sentences max. Who sent it, what they want or shared.",
   "suggested_task": "verb-first task or null",
@@ -163,7 +162,8 @@ Return ONLY valid JSON, NO markdown, NO explanation:
   "linked_project_name": "project or company name if mentioned, else null",
   "is_human_sender": true or false,
   "has_memory_value": true or false
-}}"""
+}}}}
+""")
 
     response = await call_gemini_with_retry(
         prompt,
@@ -251,7 +251,7 @@ async def ingest_outlook_messages(limit=25):
         seen_ids.add(msg_id)
 
         try:
-            existing = supabase.table('emails').select('id').eq('message_id', msg_id).maybe_single().execute()
+            existing = user_query('emails').select('id').eq('message_id', msg_id).maybe_single().execute()
             if existing is not None and getattr(existing, 'data', None):
                 skipped += 1
                 continue
@@ -290,7 +290,7 @@ async def ingest_outlook_messages(limit=25):
             classification = classification_data.get("classification", "ignored")
 
             if classification == "ignored":
-                supabase.table('emails').insert({
+                user_insert('emails', {
                     "message_id": msg_id,
                     "thread_id": normalized["thread_id"],
                     "source": "outlook",
@@ -321,7 +321,7 @@ async def ingest_outlook_messages(limit=25):
             }
 
             if classification == "fyi":
-                insert_res = supabase.table('emails').insert(email_row).execute()
+                insert_res = user_insert('emails', email_row).execute()
                 if not getattr(insert_res, 'data', None):
                     print(f"⚠️ Email insert returned no data for {subject}")
                     continue
@@ -333,7 +333,7 @@ async def ingest_outlook_messages(limit=25):
                     _summary = classification_data.get("summary", "")
                     _mem_content = f"{sender} ({sender_email}): {_summary}"
                     _emb = get_embedding(_mem_content)
-                    supabase.table('memories').insert({
+                    user_insert('memories', {
                         "content": _mem_content,
                         "memory_type": "relationship_note",
                         "embedding": _emb
@@ -347,21 +347,21 @@ async def ingest_outlook_messages(limit=25):
                 linked_person_id = None
                 linked_person_name = classification_data.get("linked_person_name")
                 if linked_person_name:
-                    person_res = supabase.table('people').select('id, name').ilike('name', f'%{linked_person_name}%').maybe_single().execute()
+                    person_res = user_query('people').select('id, name').ilike('name', f'%{linked_person_name}%').maybe_single().execute()
                     if getattr(person_res, 'data', None):
                         linked_person_id = person_res.data['id']
                 
                 linked_project_id = None
                 linked_project_name = classification_data.get("linked_project_name")
                 if linked_project_name:
-                    project_res = supabase.table('projects').select('id, name').ilike('name', f'%{linked_project_name}%').maybe_single().execute()
+                    project_res = user_query('projects').select('id, name').ilike('name', f'%{linked_project_name}%').maybe_single().execute()
                     if getattr(project_res, 'data', None):
                         linked_project_id = project_res.data['id']
                 
                 email_row['linked_person_id'] = linked_person_id
                 email_row['linked_project_id'] = linked_project_id
                 
-                insert_res = supabase.table('emails').insert(email_row).execute()
+                insert_res = user_insert('emails', email_row).execute()
                 if not getattr(insert_res, 'data', None):
                     print(f"⚠️ Email insert returned no data for {subject}")
                     continue
@@ -376,38 +376,38 @@ async def ingest_outlook_messages(limit=25):
                     if guard['result'] == 'block':
                         if guard['is_superset'] and guard['matched_id']:
                             try:
-                                supabase.table('tasks').update({'title': suggested_title}).eq('id', guard['matched_id']).execute()
+                                user_query('tasks').update({'title': suggested_title}).eq('id', guard['matched_id']).execute()
                                 print(f"🔁 Auto-updated task {guard['matched_id']}: '{guard['matched_title']}' → '{suggested_title}'")
                             except Exception as upd_err:
                                 print(f"⚠️ Auto-update failed: {upd_err}")
                         else:
                             print(f"⚠️ Duplicate guard (block): '{suggested_title}' matches existing task [{guard['matched_id']}]. Skipping.")
                     elif guard['result'] == 'flag':
-                        supabase.table('email_pending_tasks').insert({
+                        user_insert('email_pending_tasks', {
                             "email_id": email_id,
                             "suggested_title": suggested_task,
                             "suggested_project": linked_project_name,
                             "shown_in_brief": False,
-                            "danny_decision": None,
+                            "user_decision": None,
                             "is_human_sender": is_human,
                             "possible_duplicate": True,
                             "duplicate_of_title": guard['matched_title']
                         }).execute()
                         print(f"⚠️ Duplicate guard (flag): '{suggested_title}' may be similar to task '{guard['matched_title']}'. Created with flag.")
                     else:
-                        supabase.table('email_pending_tasks').insert({
+                        user_insert('email_pending_tasks', {
                             "email_id": email_id,
                             "suggested_title": suggested_task,
                             "suggested_project": linked_project_name,
                             "shown_in_brief": False,
-                            "danny_decision": None,
+                            "user_decision": None,
                             "is_human_sender": is_human
                         }).execute()
                 
                 if classification_data.get("needs_draft"):
                     draft_body = await generate_draft(sender, subject, body)
                     if draft_body:
-                        supabase.table('email_drafts').insert({
+                        user_insert('email_drafts', {
                             "email_id": email_id,
                             "draft_body": draft_body,
                             "status": "pending"
@@ -419,7 +419,7 @@ async def ingest_outlook_messages(limit=25):
         except Exception as e:
             print(f"❌ Error processing Outlook message {msg_id}: {e}")
             try:
-                supabase.table('emails').insert({
+                user_insert('emails', {
                     "message_id": msg_id,
                     "source": "outlook",
                     "sender": (sender or "unknown"),

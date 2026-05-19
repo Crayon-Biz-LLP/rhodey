@@ -1,22 +1,16 @@
 import os
 import asyncio
 from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
 from core.lib.audit_logger import audit_log_sync, error
 from core.pulse.utils import format_error
 from core.pulse.llm import get_embedding
-from core.services.db import versioned_update
-
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
+from core.services.db import get_supabase, user_query, user_insert, versioned_update
 
 
 async def update_heartbeat():
     """Update the last successful Pulse run timestamp."""
     try:
-        supabase.table('core_config').upsert({
+        user_query('core_config').upsert({
             "key": "pulse_last_success",
             "content": datetime.now(timezone.utc).isoformat()
         }, on_conflict="key").execute()
@@ -35,7 +29,7 @@ async def check_pipeline_health() -> str:
         two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
 
         # Check pending dumps
-        stuck_res = supabase.table('raw_dumps') \
+        stuck_res = user_query('raw_dumps') \
             .select('id', count='exact') \
             .in_('status', ['pending', 'staged']) \
             .lt('created_at', two_hours_ago) \
@@ -46,7 +40,7 @@ async def check_pipeline_health() -> str:
 
         # Check processing dumps (stuck > 10 minutes)
         ten_mins_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        processing_res = supabase.table('raw_dumps') \
+        processing_res = user_query('raw_dumps') \
             .select('id', count='exact') \
             .eq('status', 'processing') \
             .lt('created_at', ten_mins_ago) \
@@ -72,7 +66,7 @@ async def check_pipeline_health() -> str:
 
         # Check for null embeddings in recent memories
         seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        null_emb_res = supabase.table('memories') \
+        null_emb_res = user_query('memories') \
             .select('id', count='exact') \
             .is_('embedding', 'null') \
             .gte('created_at', seven_days_ago) \
@@ -82,7 +76,7 @@ async def check_pipeline_health() -> str:
             lines.append(f"⚠️ {null_emb_count} memories with NULL embeddings (last 7 days)")
 
         # Check last Pulse success
-        last_run_res = supabase.table('core_config') \
+        last_run_res = user_query('core_config') \
             .select('content') \
             .eq('key', 'pulse_last_success') \
             .maybe_single() \
@@ -107,7 +101,7 @@ async def retry_failed_operations(max_retries: int = 5):
     """Retry operations in the failed_queue with exponential backoff."""
     try:
         # Fetch items that haven't exceeded max retries
-        failed_items = supabase.table('failed_queue') \
+        failed_items = user_query('failed_queue') \
             .select('*') \
             .lt('retry_count', max_retries) \
             .order('created_at', desc=False) \
@@ -130,7 +124,7 @@ async def retry_failed_operations(max_retries: int = 5):
             try:
                 if operation == 'embedding' and source_table == 'memories':
                     # Retry embedding generation
-                    mem_res = supabase.table('memories') \
+                    mem_res = user_query('memories') \
                         .select('id, content') \
                         .eq('id', int(source_id)) \
                         .maybe_single() \
@@ -146,7 +140,7 @@ async def retry_failed_operations(max_retries: int = 5):
                             })
 
                             # Remove from failed queue on success
-                            supabase.table('failed_queue') \
+                            user_query('failed_queue') \
                                 .delete() \
                                 .eq('id', queue_id) \
                                 .execute()
@@ -160,7 +154,7 @@ async def retry_failed_operations(max_retries: int = 5):
                     continue
 
                 # Update retry count (metadata update, no versioning needed)
-                supabase.table('failed_queue') \
+                user_query('failed_queue') \
                     .update({
                         "retry_count": item['retry_count'] + 1,
                         "last_retry_at": datetime.now(timezone.utc).isoformat()
@@ -171,7 +165,7 @@ async def retry_failed_operations(max_retries: int = 5):
             except Exception as e:
                 # Update retry count and last_retry_at
                 try:
-                    supabase.table('failed_queue') \
+                    user_query('failed_queue') \
                         .update({
                             "retry_count": item['retry_count'] + 1,
                             "last_retry_at": datetime.now(timezone.utc).isoformat(),

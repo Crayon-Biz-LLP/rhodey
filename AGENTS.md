@@ -96,7 +96,6 @@ PULSE_SECRET
 GOOGLE_REFRESH_TOKEN
 GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
-GOOGLE_SHEET_ID  # Used in archive ingest and pulse
 OPENROUTER_API_KEY  # Fallback for LLM calls (backfill_graph, pulse)
 OPENROUTER_BASE_URL  # Default: https://openrouter.ai/api/v1/chat/completions
 PULSE_HTTP_REFERER  # Default: http://localhost:8000

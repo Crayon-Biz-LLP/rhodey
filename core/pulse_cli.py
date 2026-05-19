@@ -89,11 +89,13 @@ def main():
         print("ERROR: PULSE_SECRET not found in environment variables")
         sys.exit(1)
     
+    user_id = os.getenv("PULSE_USER_ID") or None
+    
     print(f"Pulse secret found: {'*' * 20}")
-    print("Running process_pulse...")
+    print(f"Running process_pulse for user_id={user_id or 'admin'}...")
     
     try:
-        result = asyncio.run(process_pulse(auth_secret=pulse_secret))
+        result = asyncio.run(process_pulse(auth_secret=pulse_secret, user_id=user_id))
         
         if result.get("success"):
             print(f"✓ Pulse completed successfully")

@@ -1,16 +1,11 @@
 import os
 import httpx
 from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery_cache import base
 from core.lib.duplicate_guard import check_duplicate
 from core.lib.audit_logger import audit_log_sync
-
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
+from core.services.db import user_query, user_insert, get_supabase
 
 
 class MemoryCache(base.Cache):
@@ -38,7 +33,7 @@ def is_already_in_tasks_table(title: str) -> dict:
     Returns dict with keys: result ('block'|'flag'|'clear'), matched_id, matched_title, is_superset, ratio.
     """
     try:
-        result = supabase.table('tasks')\
+        result = user_query('tasks')\
             .select('id, title')\
             .not_.in_('status', ['done', 'cancelled'])\
             .execute()
@@ -54,7 +49,7 @@ def is_recent_raw_dump(content: str, source: str) -> bool:
     Used as idempotency guard against Telegram double-fires and user double-taps."""
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
-        dup = supabase.table('raw_dumps') \
+        dup = user_query('raw_dumps') \
             .select('id') \
             .eq('content', content) \
             .eq('source', source) \
@@ -71,7 +66,7 @@ def is_recent_raw_dump(content: str, source: str) -> bool:
 
 async def get_recent_context(limit: int = 2) -> list:
     try:
-        res = supabase.table('raw_dumps')\
+        res = user_query('raw_dumps')\
             .select('content')\
             .eq('is_processed', False)\
             .order('created_at', desc=True)\
@@ -121,7 +116,7 @@ async def trigger_github_pulse() -> bool:
 async def hybrid_search_graph(query: str) -> str:
     """Graph-first search: Find primary entity and its connections."""
     try:
-        nodes_res = supabase.table('graph_nodes').select('id, label').ilike('label', f'%{query}%').limit(1).execute()
+        nodes_res = user_query('graph_nodes').select('id, label').ilike('label', f'%{query}%').limit(1).execute()
 
         if not nodes_res.data:
             return ""
@@ -129,7 +124,7 @@ async def hybrid_search_graph(query: str) -> str:
         primary_node = nodes_res.data[0]
         primary_id = primary_node['id']
 
-        edges_res = supabase.table('graph_edges').select('source_node_id, target_node_id, relationship').or_(f'source_node_id.eq.{primary_id},target_node_id.eq.{primary_id}').execute()
+        edges_res = user_query('graph_edges').select('source_node_id, target_node_id, relationship').or_(f'source_node_id.eq.{primary_id},target_node_id.eq.{primary_id}').execute()
 
         if not edges_res.data:
             return ""
@@ -143,7 +138,7 @@ async def hybrid_search_graph(query: str) -> str:
                 connected_ids.add(edge['source_node_id'])
 
         if connected_ids:
-            labels_res = supabase.table('graph_nodes').select('id, label').in_('id', list(connected_ids)).execute()
+            labels_res = user_query('graph_nodes').select('id, label').in_('id', list(connected_ids)).execute()
             label_map = {str(n['id']): n['label'] for n in labels_res.data}
 
             labeled_map = []

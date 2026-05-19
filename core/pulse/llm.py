@@ -5,15 +5,18 @@ import asyncio
 import time
 import random
 import httpx
-from supabase import create_client, Client
-from google import genai
 from core.lib.audit_logger import audit_log_sync
 from core.lib.rate_limiter import flash_lite_limiter
+from core.services.db import get_supabase, user_query, user_insert
 
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
+_gemini_client = None
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
+        _gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    return _gemini_client
 
 
 def is_already_in_email_queue(title: str) -> bool:
@@ -23,10 +26,10 @@ def is_already_in_email_queue(title: str) -> bool:
         if not keywords:
             return False
         for kw in keywords[:3]:
-            result = supabase.table('email_pending_tasks')\
+            result = user_query('email_pending_tasks')\
                 .select('id')\
                 .ilike('suggested_title', f'%{kw}%')\
-                .is_('danny_decision', 'null')\
+                .is_('user_decision', 'null')\
                 .limit(1)\
                 .execute()
             if result.data:
@@ -35,7 +38,7 @@ def is_already_in_email_queue(title: str) -> bool:
 
         # Semantic embedding check (high threshold to avoid false positives)
         embedding = get_embedding(title)
-        similarity_res = supabase.rpc('match_memories', {
+        similarity_res = get_supabase().rpc('match_memories', {
             'query_embedding': embedding,
             'match_count': 1,
             'match_threshold': 0.88
@@ -61,13 +64,13 @@ async def call_gemini_with_retry(prompt: str, model: str = None, config: dict = 
     for attempt in range(max_retries):
         try:
             if contents is not None:
-                response = gemini_client.models.generate_content(
+                response = _get_gemini_client().models.generate_content(
                     model=model,
                     contents=contents,
                     config=config or {}
                 )
             else:
-                response = gemini_client.models.generate_content(
+                response = _get_gemini_client().models.generate_content(
                     model=model,
                     contents=prompt,
                     config=config or {}
@@ -160,7 +163,7 @@ async def call_llm_with_fallback(
         {
             "provider": "gemini",
             "model": model,
-            "fn": lambda p, c, cfg: gemini_client.models.generate_content(
+            "fn": lambda p, c, cfg: _get_gemini_client().models.generate_content(
                 model=model,
                 contents=c if c else p,
                 config=cfg or {}
@@ -169,7 +172,7 @@ async def call_llm_with_fallback(
         {
             "provider": "gemma",
             "model": GEMMA_FALLBACK_MODEL,
-            "fn": lambda p, c, cfg: gemini_client.models.generate_content(
+            "fn": lambda p, c, cfg: _get_gemini_client().models.generate_content(
                 model=GEMMA_FALLBACK_MODEL,
                 contents=c if c else p,
                 config=cfg or {}
@@ -206,7 +209,7 @@ async def call_llm_with_fallback(
                     if hasattr(response, 'text'):
                         output_tokens = len(response.text) // 4
 
-                    supabase.table('model_registry').insert({
+                    user_insert('model_registry', {
                         "model_name": model_name,
                         "provider": provider_name,
                         "input_tokens": input_tokens,
@@ -301,7 +304,7 @@ def get_embedding(text: str) -> list:
     """Generate embedding for text using gemini-embedding-2-preview."""
     try:
         # 🎯 FORCE 768 dimensions to match your Supabase schema
-        result = gemini_client.models.embed_content(
+        result = _get_gemini_client().models.embed_content(
             model=EMBEDDING_MODEL,
             contents=text,
             config={
@@ -344,8 +347,6 @@ OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 RETRYABLE_ERRORS = ['503', '504', '500', 'disconnected', 'timeout', 'deadline exceeded', 'unavailable', 'overloaded', 'rate limit']
 
 NON_RETRYABLE_ERRORS = ['401', '403', '400', 'invalid']
-
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 EMBEDDING_MODEL = "gemini-embedding-2-preview"
 

@@ -4,6 +4,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.discovery_cache import base
 from core.lib.audit_logger import audit_log_sync
+from core.services.db import get_supabase, get_current_user_id
 
 
 class _MemoryCache(base.Cache):
@@ -16,7 +17,26 @@ class _MemoryCache(base.Cache):
         self._cache[url] = content
 
 
-def get_google_creds():
+def get_google_creds(user_id=None):
+    """Get Google credentials. Looks up per-user tokens from user_google_tables if user_id
+    is provided or available from request context. Falls back to global GOOGLE_REFRESH_TOKEN env var."""
+    if not user_id:
+        user_id = get_current_user_id()
+
+    if user_id:
+        tokens = get_supabase().table('user_google_tokens')\
+            .select('*').eq('user_id', user_id).maybe_single().execute()
+        if tokens.data:
+            t = tokens.data
+            return Credentials(
+                t.get('access_token'),
+                refresh_token=t['refresh_token'],
+                client_id=os.getenv("GOOGLE_CLIENT_ID"),
+                client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+                token_uri="https://oauth2.googleapis.com/token",
+                expiry=datetime.fromisoformat(t['expiry'].replace('Z', '+00:00')) if t.get('expiry') else None
+            )
+
     return Credentials(
         None,
         refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
@@ -26,8 +46,8 @@ def get_google_creds():
     )
 
 
-def get_tasks_service():
-    return build('tasks', 'v1', credentials=get_google_creds(), cache=_MemoryCache())
+def get_tasks_service(user_id=None):
+    return build('tasks', 'v1', credentials=get_google_creds(user_id), cache=_MemoryCache())
 
 
 def format_rfc3339(date_str):
@@ -41,8 +61,8 @@ def format_rfc3339(date_str):
     return clean
 
 
-def sync_to_calendar(title, start_iso, duration_mins=15, event_id=None):
-    service = build('calendar', 'v3', credentials=get_google_creds(), cache=_MemoryCache())
+def sync_to_calendar(title, start_iso, duration_mins=15, event_id=None, user_id=None):
+    service = build('calendar', 'v3', credentials=get_google_creds(user_id), cache=_MemoryCache())
     try:
         rfc_time = format_rfc3339(start_iso)
         start_dt = datetime.fromisoformat(rfc_time.replace('Z', '+00:00'))
@@ -60,15 +80,15 @@ def sync_to_calendar(title, start_iso, duration_mins=15, event_id=None):
         return res.get('id')
     except Exception as e:
         if event_id:
-            return sync_to_calendar(title, start_iso, event_id=None)
+            return sync_to_calendar(title, start_iso, event_id=None, user_id=user_id)
         audit_log_sync("google_service", "ERROR", f"Calendar sync failed: {e}")
         return None
 
 
-def delete_calendar_event(event_id):
+def delete_calendar_event(event_id, user_id=None):
     if not event_id:
         return
-    service = build('calendar', 'v3', credentials=get_google_creds(), cache=_MemoryCache())
+    service = build('calendar', 'v3', credentials=get_google_creds(user_id), cache=_MemoryCache())
     try:
         service.events().delete(calendarId='primary', eventId=event_id).execute()
     except Exception:
@@ -98,9 +118,9 @@ def sync_to_google(service, title=None, due_at=None, task_id=None, status='todo'
         return None
 
 
-def get_google_calendar_events(target_date):
+def get_google_calendar_events(target_date, user_id=None):
     try:
-        service = build("calendar", "v3", credentials=get_google_creds(), cache=_MemoryCache())
+        service = build("calendar", "v3", credentials=get_google_creds(user_id), cache=_MemoryCache())
         start_dt = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
         end_dt = start_dt + timedelta(days=1)
         rfc_start = format_rfc3339(start_dt.isoformat())
@@ -128,9 +148,9 @@ def get_google_calendar_events(target_date):
         return []
 
 
-def get_google_calendar_events_range(start_date, end_date):
+def get_google_calendar_events_range(start_date, end_date, user_id=None):
     try:
-        service = build("calendar", "v3", credentials=get_google_creds(), cache=_MemoryCache())
+        service = build("calendar", "v3", credentials=get_google_creds(user_id), cache=_MemoryCache())
         start_dt = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
         end_dt = end_date.replace(hour=23, minute=59, second=59)
         rfc_start = format_rfc3339(start_dt.isoformat())
@@ -159,9 +179,9 @@ def get_google_calendar_events_range(start_date, end_date):
         return []
 
 
-def check_conflict(start_iso):
+def check_conflict(start_iso, user_id=None):
     try:
-        service = build('calendar', 'v3', credentials=get_google_creds(), cache=_MemoryCache())
+        service = build('calendar', 'v3', credentials=get_google_creds(user_id), cache=_MemoryCache())
         rfc_time = format_rfc3339(start_iso)
         start_dt = datetime.fromisoformat(rfc_time.replace('Z', '+00:00'))
         end_dt = start_dt + timedelta(minutes=30)
@@ -178,8 +198,8 @@ def check_conflict(start_iso):
         return None
 
 
-def get_calendar_context(target_date):
-    events = get_google_calendar_events(target_date)
+def get_calendar_context(target_date, user_id=None):
+    events = get_google_calendar_events(target_date, user_id=user_id)
     if not events:
         return "None"
     events.sort(key=lambda x: x["time"])

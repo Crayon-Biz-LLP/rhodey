@@ -11,12 +11,9 @@ Alerts via Telegram if issues found. Silent if healthy.
 import os
 from datetime import datetime, timezone, timedelta
 
-from core.services.db import get_supabase
+from core.services.db import user_query, get_supabase
 from core.services.telegram import send_telegram
 
-supabase = get_supabase()
-
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 IST_OFFSET = timedelta(hours=5, minutes=30)
 BIZ_START_UTC = 3
@@ -31,7 +28,7 @@ def is_business_hours():
 
 def check_stalled_dumps():
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    res = supabase.table('raw_dumps') \
+    res = user_query('raw_dumps') \
         .select('id', count='exact') \
         .in_('status', ['pending', 'staged']) \
         .lt('created_at', cutoff) \
@@ -40,6 +37,7 @@ def check_stalled_dumps():
 
 
 def check_failed_queue():
+    supabase = get_supabase()
     res = supabase.table('failed_queue') \
         .select('id', count='exact') \
         .lt('retry_count', 5) \
@@ -48,6 +46,7 @@ def check_failed_queue():
 
 
 def check_recent_errors():
+    supabase = get_supabase()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     res = supabase.table('audit_logs') \
         .select('id', count='exact') \
@@ -58,6 +57,7 @@ def check_recent_errors():
 
 
 def check_dlq_unresolved():
+    supabase = get_supabase()
     res = supabase.table('failed_queue') \
         .select('id', count='exact') \
         .gte('retry_count', 5) \
@@ -66,6 +66,7 @@ def check_dlq_unresolved():
 
 
 async def main():
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not is_business_hours():
         print("[JANITOR] Outside IST business hours. Skipping.")
         return
@@ -94,8 +95,8 @@ async def main():
 
     alert = f"Rhodey Janitor:\n" + "\n".join(issues)
     print(f"[JANITOR] Issues found:\n{alert}")
-    if TELEGRAM_CHAT_ID:
-        await send_telegram(int(TELEGRAM_CHAT_ID), alert)
+    if telegram_chat_id:
+        await send_telegram(int(telegram_chat_id), alert)
 
 
 if __name__ == "__main__":

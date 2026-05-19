@@ -4,15 +4,10 @@ import json
 import asyncio
 import httpx
 from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
 from core.lib.audit_logger import audit_log_sync
-from core.services.db import versioned_update
+from core.lib.prompt_template import render_prompt
+from core.services.db import get_supabase, user_query, user_insert, versioned_update
 from core.pulse.llm import call_llm_with_fallback, parse_json_response, get_embedding
-
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
 
 
 async def fetch_url_metadata(url: str):
@@ -35,7 +30,7 @@ async def fetch_url_metadata(url: str):
     return {"title": "Unknown", "description": ""}
 
 async def batch_enrich_resources():
-    unenriched = supabase.table('resources').select('id, url').is_('enriched_at', None).execute()
+    unenriched = user_query('resources').select('id, url').is_('enriched_at', None).execute()
     if not unenriched.data:
         print("📚 No unenriched resources found.")
         return []
@@ -55,13 +50,12 @@ async def batch_enrich_resources():
     if not enrichment_data:
         return []
 
-    prompt = f"""You are Danny's Trusted Partner. For each resource below, provide a strategic_note (one sentence on strategic value) and category.
+    prompt = render_prompt(f"""You are {{owner_name}}'s Trusted Partner. For each resource below, provide a strategic_note (one sentence on strategic value) and category.
 
-    Categories: COMPETITOR, TECH_TOOL, LEAD_POTENTIAL, MARKET_TREND, ASHRAYA, PERSONAL
+    Categories: COMPETITOR, TECH_TOOL, LEAD_POTENTIAL, MARKET_TREND, {{default_domain_tag}}
     Rules:
-    - ASHRAYA for Ashraya church admin/operations content
-    - PERSONAL for family/home/personal spiritual topics
-    - COMPETITOR for competitors to Qhord
+    - {{default_domain_tag}} for resources related to your default domain
+    - COMPETITOR for competitors to your core product/domain
     - TECH_TOOL for SaaS/dev/productivity tools
     - LEAD_POTENTIAL for potential clients/partners
     - MARKET_TREND for market patterns/industry shifts
@@ -69,12 +63,12 @@ async def batch_enrich_resources():
 
     Return ONLY valid JSON array:
     [
-    {{"id": 1, "strategic_note": "...", "category": "..."}},
+    {{{{ "id": 1, "strategic_note": "...", "category": "..." }}}},
     ...
     ]
 
     Resources:
-    {json.dumps(enrichment_data, indent=2)}"""
+    {json.dumps(enrichment_data, indent=2)}""")
 
     try:
         response = await call_llm_with_fallback(
@@ -118,10 +112,10 @@ async def batch_enrich_resources():
 
         # MISSION RESOLVER: Link enriched resources to active missions by name
         try:
-            missions_res = supabase.table('missions').select('id, title').eq('status', 'active').execute()
+            missions_res = user_query('missions').select('id, title').eq('status', 'active').execute()
             active_missions = missions_res.data or []
 
-            unlinked = supabase.table('resources').select('id, title, strategic_note').is_('mission_id', None).not_.is_('enriched_at', None).execute()
+            unlinked = user_query('resources').select('id, title, strategic_note').is_('mission_id', None).not_.is_('enriched_at', None).execute()
 
             for resource in (unlinked.data or []):
                 resource_text = f"{resource.get('title', '')} {resource.get('strategic_note', '')}".lower()

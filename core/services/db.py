@@ -1,8 +1,23 @@
 import os
+import contextvars
 from supabase import create_client, Client
 from core.lib.audit_logger import audit_log_sync
 
 _supabase: Client = None
+_current_user_id: contextvars.ContextVar = contextvars.ContextVar('current_user_id', default=None)
+
+SYSTEM_TABLES = {'core_config', 'audit_logs', 'failed_queue', 'model_registry', 'processed_updates', 'canonical_pages'}
+
+
+def set_current_user(user_id: str):
+    """Set the current user_id for the request context. All subsequent user_query() calls
+    will automatically filter by this user_id."""
+    _current_user_id.set(user_id)
+
+
+def get_current_user_id() -> str:
+    """Get the current user_id from request context."""
+    return _current_user_id.get()
 
 
 def get_supabase() -> Client:
@@ -13,6 +28,28 @@ def get_supabase() -> Client:
             os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         )
     return _supabase
+
+
+def user_query(table_name: str, user_id: str = None):
+    """Returns a supabase table query builder with user_id pre-filtered.
+    Falls back to _current_user_id context var if no user_id given.
+    Skips user_id for system tables (core_config, audit_logs, etc.).
+    """
+    uid = user_id or get_current_user_id()
+    query = get_supabase().table(table_name)
+    if table_name not in SYSTEM_TABLES and uid:
+        query = query.eq('user_id', uid)
+    return query
+
+
+def user_insert(table_name: str, data: dict, user_id: str = None):
+    """Insert a record with user_id automatically injected.
+    Skips user_id for system tables.
+    """
+    uid = user_id or get_current_user_id()
+    if table_name not in SYSTEM_TABLES and uid:
+        data = {**data, "user_id": uid}
+    return get_supabase().table(table_name).insert(data)
 
 
 def get_embedding(text: str, model: str = "gemini-embedding-2-preview", dimension: int = 768) -> list:

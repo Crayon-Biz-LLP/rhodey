@@ -3,16 +3,17 @@ from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
+from core.lib.prompt_template import render_prompt, get_persona_context
 from core.lib.audit_logger import info, warning, error, audit_log_sync
 from core.lib.people_utils import normalize_person_name, is_blocklisted_person
 from core.lib.temporal_lineage import detect_drift
 from core.lib.conversation import get_or_create_session, format_history_for_prompt
 
-from core.services.db import versioned_update
+from core.services.db import versioned_update, get_supabase, user_query, user_insert, set_current_user
 from core.services.google_service import get_tasks_service, format_rfc3339, delete_calendar_event, sync_to_google
 
 from core.pulse.llm import (
-    supabase, parse_json_response, call_llm_with_fallback, get_embedding,
+    parse_json_response, call_llm_with_fallback, get_embedding,
     BRIEFING_MODEL, is_already_in_email_queue,
 )
 from core.pulse.utils import format_error, get_project_name, build_routing_context, normalize_mission_title
@@ -25,6 +26,7 @@ from core.pulse.graph import (
     write_graph_edges_for_task, check_task_dependencies,
     analyze_communication_patterns, fetch_hybrid_graph_context, fetch_graph_task_context,
 )
+from core.lib.domain_utils import valid_tags as get_valid_tags, context_map as get_context_map, get_default_tag as get_default_domain_tag
 from core.pulse.pipeline import update_heartbeat, check_pipeline_health
 from core.pulse.calendar import (
     get_calendar_context, check_conflict, sync_to_calendar,
@@ -47,7 +49,7 @@ class CompletedTask(BaseModel):
 class NewProject(BaseModel):
     name: str
     importance: Optional[int] = 5
-    org_tag: Optional[str] = "SOLVSTRAT"
+    org_tag: Optional[str] = None
     context: Optional[str] = "work"
     description: Optional[str] = None
     keywords: Optional[List[str]] = Field(default_factory=list)
@@ -96,7 +98,7 @@ class PulseOutput(BaseModel):
 async def add_to_failed_queue(source_table: str, source_id: str, operation: str, error_message: str):
     """Add a failed operation to the retry queue."""
     try:
-        supabase.table('failed_queue').insert({
+        user_insert('failed_queue', {
             "source_table": source_table,
             "source_id": str(source_id),
             "operation": operation,
@@ -109,14 +111,28 @@ async def add_to_failed_queue(source_table: str, source_id: str, operation: str,
 
 
 
-async def process_pulse(auth_secret: str = None, request_id: str = None):
+async def process_pulse(auth_secret: str = None, request_id: str = None, user_id: str = None):
     """
     Process pulse with optional request_id for idempotency.
     
     Args:
         auth_secret: Pulse secret for auth
         request_id: Unique ID for idempotency (prevents duplicate processing)
+        user_id: Run pulse for a specific user. If None, runs for the first approved admin user.
     """
+    if not user_id:
+        admin = get_supabase().table('user_profiles')\
+            .select('user_id')\
+            .eq('approval_status', 'approved')\
+            .order('created_at')\
+            .limit(1)\
+            .maybe_single()\
+            .execute()
+        if admin.data:
+            user_id = admin.data['user_id']
+    if user_id:
+        set_current_user(user_id)
+    _pctx = get_persona_context(user_id)
     error_log = []
     try:
         # 🛡️ IDEMPOTENCY CHECK: If request_id provided, check if already processed
@@ -124,7 +140,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         if request_id:
             # Always use metadata->>request_id (JSONB) for idempotency
             # This works whether or not the dedicated column exists
-            existing = supabase.table('raw_dumps') \
+            existing = user_query('raw_dumps') \
                 .select('id, status') \
                 .eq('metadata->>request_id', request_id) \
                 .limit(1) \
@@ -137,7 +153,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         # 🛡️ THE ZOMBIE RECOVERY: Reset any dumps stuck in 'processing' for more than 10 mins
         try:
             ten_mins_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-            supabase.table('raw_dumps') \
+            user_query('raw_dumps') \
                 .update({"status": "pending"}) \
                 .eq('status', 'processing') \
                 .lt('created_at', ten_mins_ago) \
@@ -154,7 +170,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
 
         # --- 0. GOOGLE→SUPABASE SYNC (After auth check) ---
         tasks_service = get_tasks_service()
-        completed_from_google = await asyncio.to_thread(sync_completed_tasks_from_google, supabase, tasks_service)
+        completed_from_google = await asyncio.to_thread(sync_completed_tasks_from_google, get_supabase(), tasks_service)
         for title, proj_name in (completed_from_google or []):
             await write_outcome_memory(title, proj_name)
         
@@ -179,7 +195,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         
         # --- 1. READ: Fetch and Lock ---
         # 1.1 Fetch pending, staged, and synced items
-        dumps_res = supabase.table('raw_dumps') \
+        dumps_res = user_query('raw_dumps') \
             .select('id, content, metadata, status') \
             .in_('status', ['pending', 'staged', 'synced']) \
             .execute()
@@ -208,35 +224,35 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                         else:
                             meta = {}
                         meta['request_id'] = request_id
-                        supabase.table('raw_dumps') \
+                        user_query('raw_dumps') \
                             .update({"metadata": meta}) \
                             .eq('id', d['id']) \
                             .execute()
                     except:
                         pass
             
-            supabase.table('raw_dumps') \
+            user_query('raw_dumps') \
                 .update({"status": "processing"}) \
                 .in_('id', dump_ids) \
                 .execute()
             
             print(f"🔒 Locked {len(dump_ids)} dumps for processing.")
 
-        active_tasks_res = supabase.table('tasks').select('id, title, project_id, priority, created_at, reminder_at, google_event_id').eq('is_current', True).not_.in_('status', ['done', 'cancelled']).execute()
+        active_tasks_res = user_query('tasks').select('id, title, project_id, priority, created_at, reminder_at, google_event_id').eq('is_current', True).not_.in_('status', ['done', 'cancelled']).execute()
         active_tasks = active_tasks_res.data or []
 
         # --- 🗃️ STAGING AREA SORTER (Pre-Processor) ---
         if dumps:
-            sort_prompt = f"""You are Danny's Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to Danny's vision. You don't coach or 'motivate.' Speak simply and punchy.
+            sort_prompt = f"""You are {_pctx['owner_name']}'s Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to {_pctx['owner_name']}'s vision. You don't coach or 'motivate.' Speak simply and punchy.
 
-            PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm Danny's task is SECURED in his system.
+            PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm {_pctx['owner_name']}'s task is SECURED in his system.
             Categorize each input into one of three types:
-            - TASK: Explicit action items, things to do, commitments, reminders, or things Danny wants to track.
+            - TASK: Explicit action items, things to do, commitments, reminders, or things {_pctx['owner_name']} wants to track.
             - COMPLETION: Past tense signals — "finished", "done", "sorted", "checked", "confirmed", "spoke with", "met with", "called", "sent", "I have...", "I've..."
             - NOTE: Ideas, insights, observations, learnings, or things worth remembering but not actionable
             - NOISE: Casual conversation, acknowledgments, confirmations, or low-value content
             Rhodey Rule: Be dismissive of NOISE. If it's low-value chatter, categorize it and keep the brief silent about it.
-            If an input is 'Check with X,' categorize it as a TASK for Danny, never as something for the system to do.
+            If an input is 'Check with X,' categorize it as a TASK for {_pctx['owner_name']}, never as something for the system to do.
 
             Return ONLY a valid JSON array (no markdown, no explanation):
             [{{"id": {dumps[0]['id']}, "category": "TASK|COMPLETION|NOTE|NOISE"}}, ...]
@@ -283,7 +299,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                             embedding = await asyncio.to_thread(get_embedding, dump_content)
                             status = 'success' if embedding and any(embedding) else 'failed'
                             try:
-                                result = supabase.table('memories').insert({
+                                result = user_insert('memories', {
                                     "content": dump_content,
                                     "memory_type": "note",
                                     "embedding": embedding,
@@ -311,7 +327,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                         completion_dump_ids.append(dump_id)
                 
                 if note_dump_ids:
-                    supabase.table('raw_dumps').update({"status": "completed", "is_processed": True}).in_('id', note_dump_ids).execute()
+                    user_query('raw_dumps').update({"status": "completed", "is_processed": True}).in_('id', note_dump_ids).execute()
                     print(f"🗃️ Staging Area: {len(task_dump_ids)} tasks, {len(note_dump_ids)} notes/noise")
                 
                 dumps = [d for d in dumps if d['id'] in task_dump_ids]
@@ -327,11 +343,11 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         print("📦 Step 1: Fetching metadata...")
 
         # Fetch supporting metadata
-        core_res = supabase.table('core_config').select('key, content').execute()
+        core_res = user_query('core_config').select('key, content').execute()
         core = core_res.data or []
 
         # Fetch business context from graph
-        graph_projects_res = supabase.table('graph_nodes').select('id', 'label', 'metadata').eq('type', 'project').execute()
+        graph_projects_res = user_query('graph_nodes').select('id', 'label', 'metadata').eq('type', 'project').execute()
         graph_projects = graph_projects_res.data or []
 
         projects = []
@@ -355,19 +371,19 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             })
 
         print("📦 Step 2: Fetching projects...")
-        projects_res = supabase.table('projects') \
+        projects_res = user_query('projects') \
             .select('id, name, org_tag, description, parent_project_id, status, keywords') \
             .eq('status', 'active') \
             .execute()
         legacy_projects = projects_res.data or []
 
         print("📦 Step 3: Fetching people...")
-        people_res = supabase.table('people').select('name, strategic_weight').execute()
+        people_res = user_query('people').select('name, strategic_weight').execute()
         people = people_res.data or []
 
         print("📦 Step 4: Fetching missions...")
         # Fetch Active Missions for Context
-        missions_res = supabase.table('missions').select('id, title').eq('status', 'active').execute()
+        missions_res = user_query('missions').select('id, title').eq('status', 'active').execute()
         active_missions = missions_res.data or []
         mission_names = [m['title'] for m in active_missions]
 
@@ -387,15 +403,15 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             # 🌅 MORNING: Extended to Noon to catch your first run
             if hour < 12:
                 briefing_mode = "Morning Status: We're cleared."
-                system_persona = "Cut through the noise and focus Danny on what moves the needle today. No coaching, no motivation—just what needs doing."
+                system_persona = render_prompt("Cut through the noise and focus {owner_name} on what moves the needle today. No coaching, no motivation—just what needs doing.")
             # ☀️ AFTERNOON: Focused execution window (Noon to 3:30 PM)
             elif hour < 15 or (hour == 15 and now.minute < 30):
                 briefing_mode = "Afternoon Check: Moving the needle."
-                system_persona = "Focused on the main effort. Keep Danny building toward the goal. Be direct."
+                system_persona = render_prompt("Focused on the main effort. Keep {owner_name} building toward the goal. Be direct.")
             # 🌇 CLOSING LOOP: Gear shift to family (3:30 PM to 6:30 PM)
             elif hour < 19:
                 briefing_mode = "Closing the loop: Sign off."
-                system_persona = "Push Danny to close work tasks so he can transition to family. Log pending items. Be dry."
+                system_persona = render_prompt("Push {owner_name} to close work tasks so he can transition to family. Log pending items. Be dry.")
             # 🌙 NIGHT: Secure the board (After 7:00 PM)
             else:
                 briefing_mode = "Intel: Vaulted."
@@ -436,14 +452,19 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             project = next((p for p in legacy_projects if p.get('id') == t.get('project_id')), None)
             o_tag = project.get('org_tag') if project else "INBOX"
 
+            dom_config = _pctx.get('domains_config', [])
+            cmap = get_context_map(dom_config)
+            work_tags = {t for t, c in cmap.items() if c == 'work'} | {'INBOX'}
+            personal_tags = {t for t, c in cmap.items() if c == 'personal'}
+
             if is_weekend:
-                if o_tag in ['PERSONAL', 'ASHRAYA']:
+                if o_tag in personal_tags:
                     filtered_tasks.append(t)
             elif hour < 19:
-                if o_tag in ['SOLVSTRAT', 'CRAYON', 'INBOX']:
+                if o_tag in work_tags:
                     filtered_tasks.append(t)
             else:
-                if o_tag in ['PERSONAL', 'ASHRAYA']:
+                if o_tag in personal_tags:
                     filtered_tasks.append(t)
 
         # --- 1.4 CONTEXT COMPRESSION & PRUNING ---
@@ -567,9 +588,9 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         task_inputs = [d['content'] for d in dumps] if dumps else []
 
         # 🕸️ ADD-ON: Graph-aware person→task context (non-blocking)
-        people_res = supabase.table('people').select('id, name').execute()
+        people_res = user_query('people').select('id, name').execute()
         people = people_res.data or []
-        projects_res = supabase.table('graph_nodes').select('id', 'label').eq('type', 'project').execute()
+        projects_res = user_query('graph_nodes').select('id', 'label').eq('type', 'project').execute()
         graph_node_projects = projects_res.data or []
         if people and active_tasks:
             graph_task_context = await fetch_graph_task_context(people, active_tasks)
@@ -604,7 +625,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             if (now - last_seen).total_seconds() > (36 * 3600):
                 is_hindsight_stale = True
 
-        recent_lib = supabase.table('resources')\
+        recent_lib = user_query('resources')\
             .select('url, category, title, summary, strategic_note, created_at')\
             .gt('created_at', thirty_days_ago)\
             .order('created_at', desc=True)\
@@ -646,10 +667,10 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         adaptive_context = await adaptive_briefing_learner()
         
         # Fetch email-suggested tasks not yet shown in brief
-        pending_email_tasks_res = supabase.table('email_pending_tasks')\
+        pending_email_tasks_res = user_query('email_pending_tasks')\
             .select('id, suggested_title, suggested_project, email_id')\
             .eq('shown_in_brief', False)\
-            .is_('danny_decision', None)\
+            .is_('user_decision', None)\
             .execute()
 
         pending_email_tasks = pending_email_tasks_res.data or []
@@ -701,7 +722,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
 
         if relevant_project_names:
             or_string = ",".join([f"title.ilike.%{name}%" for name in relevant_project_names])
-            pages_res = supabase.table('canonical_pages').select('title, content').or_(or_string).execute()
+            pages_res = user_query('canonical_pages').select('title, content').or_(or_string).execute()
             if pages_res.data:
                 page_entries = [f"[CANONICAL CONTEXT ONLY — DO NOT LIST IN BRIEFING]\n### MASTER PAGE: {p['title']}\n{p['content']}" for p in pages_res.data]
                 master_page_context = "\n\n".join(page_entries)
@@ -717,11 +738,11 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             if is_discovery_pulse:
                 print("📍 Weekend pulse: Running practice detection...")
                 before_labels = set()
-                before_res = supabase.table('graph_nodes').select('label').eq('type', 'practice').execute()
+                before_res = user_query('graph_nodes').select('label').eq('type', 'practice').execute()
                 for r in (before_res.data or []):
                     before_labels.add(r['label'])
                 new_practice_ids = await detect_practices() or {}
-                after_res = supabase.table('graph_nodes').select('label').eq('type', 'practice').execute()
+                after_res = user_query('graph_nodes').select('label').eq('type', 'practice').execute()
                 after_labels = set(r['label'] for r in (after_res.data or []))
                 new_practice_labels = sorted(after_labels - before_labels)
                 if new_practice_labels:
@@ -743,7 +764,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         calendar_context = get_calendar_context(target_day)
 
         prompt = f"""    
-        ROLE: Danny's Rhodey. You are his most trusted advisor — the one who cuts through the noise and tells him exactly where he stands. You have full situational awareness of his work, family, and faith. You don't coach, motivate, or perform. You speak plainly, like a friend who has been in the room the whole time. Your job is to give Danny a clear picture of the board so he can make his next move.
+        ROLE: {_pctx['owner_name']}'s Rhodey. You are his most trusted advisor — the one who cuts through the noise and tells him exactly where he stands. You have full situational awareness of his work, family, and faith. You don't coach, motivate, or perform. You speak plainly, like a friend who has been in the room the whole time. Your job is to give {_pctx['owner_name']} a clear picture of the board so he can make his next move.
         {conversation_history}
         STRATEGIC CONTEXT: {season_config}
         CURRENT PHASE: {briefing_mode}
@@ -796,7 +817,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         - ENRICHED WEB LINKS: {link_context}
         - NEW INPUTS: {new_inputs_text}
         - SYNCED TASK UPDATES (already processed, for context only): {synced_inputs_text}
-        - 📧 EMAIL-SUGGESTED TASKS (surface these in the brief under a section called "📧 Inbox" — Danny decides whether to create them as tasks, do not auto-create):
+        - 📧 EMAIL-SUGGESTED TASKS (surface these in the brief under a section called "📧 Inbox" — {_pctx['owner_name']} decides whether to create them as tasks, do not auto-create):
         {chr(10).join(f"- {t['suggested_title']} (Project: {t.get('suggested_project') or 'Unknown'})" for t in pending_email_tasks) if pending_email_tasks else "None"}
 
         INSTRUCTIONS:
@@ -809,12 +830,12 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             - HEADER SPACING: Double-space before headers (e.g., \n\n🚀 Work) and single-space after them.
             - NO NUMBERING: Use headers and icons only. Never use '1.' or '2.' to separate strategic points.
             - TONAL GUARD: Keep the 'Intel: Vaulted' or 'Intel: Secured' style for the Night phase, but never sacrifice vertical layout.
-            - STRICT DATA FIDELITY FOR BRIEFING: You are STRICTLY FORBIDDEN from listing any task in ANY section (Work, Home, Church, Ideas, or Done) that does not appear verbatim in the SYSTEM TASKS list provided below. Do NOT surface tasks from HINDSIGHT MEMORIES, Canonical Pages, or any other context into the briefing output. All context is for intelligence and routing only — NEVER for output.
-            - EMPTY SECTION SUPPRESSION: If a section (Work, Home, Church, Done, Ideas) has absolutely zero items to list, you MUST completely omit that section header from the briefing. Never output 'None today' or 'Empty'. Silence is preferred.
+            - STRICT DATA FIDELITY FOR BRIEFING: You are STRICTLY FORBIDDEN from listing any task in ANY section (Work, Home, Community, Ideas, or Done) that does not appear verbatim in the SYSTEM TASKS list provided below. Do NOT surface tasks from HINDSIGHT MEMORIES, Canonical Pages, or any other context into the briefing output. All context is for intelligence and routing only — NEVER for output.
+            - EMPTY SECTION SUPPRESSION: If a section has absolutely zero items to list, you MUST completely omit that section header from the briefing. Never output 'None today' or 'Empty'. Silence is preferred.
             - HEADLINE RULE: Use exactly "{briefing_mode}".
-            - THE COMPASS (OPENING SYNTHESIS): Do not create a separate section for his journal. Instead, start the briefing with 1-2 sharp sentences that seamlessly weave his latest HINDSIGHT insights (Faith Score, Emotional Intensity, Takeaways, or [PROPHECY]) into the current tactical reality (Qhord, Solvstrat, Debt). 
+            - THE COMPASS (OPENING SYNTHESIS): Do not create a separate section for his journal. Instead, start the briefing with 1-2 sharp sentences that seamlessly weave his latest HINDSIGHT insights (Faith Score, Emotional Intensity, Takeaways, or [PROPHECY]) into the current tactical reality. 
             - COMPASS TONE: If HINDSIGHT_STALE is FALSE, weave the latest hindsight insights into a sharp, forward-leaning opening.
-              IF HINDSIGHT_STALE is TRUE: Do NOT repeat old insights. Instead, acknowledge the silence with a dry, one-sentence observation (e.g., 'The signal is quiet on the reflection front, Danny. Let's look at the board.') and move immediately to the tactical list.
+              IF HINDSIGHT_STALE is TRUE: Do NOT repeat old insights. Instead, acknowledge the silence with a dry, one-sentence observation (e.g., 'The signal is quiet on the reflection front, {_pctx['owner_name']}. Let's look at the board.') and move immediately to the tactical list.
             - COMPASS LENS (Temporal Variety):
                 - MORNING: Focus on the 'Delta'. What happened overnight? What is the single most important pivot for TODAY?
                 - AFTERNOON: Focus on 'Velocity'. Don't repeat the strategy; call out what is actually moving (or stalled) in the last 4 hours.
@@ -826,21 +847,20 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             - SECTIONS: 
                 ✅ Done: ONLY list tasks that were moved to "completed_task_ids" in this specific run. NEVER list items from HINDSIGHT_MEMORIES in this section.
                 🚀 Work: Active tasks from SYSTEM_TASKS only.
-                🏠 Home: Family and personal tasks only. Do NOT include Ashraya/Church tasks here.
-                ⛪ Church: Ashraya church admin, operations, finance, and organizational tasks only.
+                🏠 Home: Family and personal tasks only.
+                🏛️ Community: Community admin, operations, and organizational tasks only.
                 💡 - Ideas: ONLY list items that appear in NEWLY ENRICHED RESOURCES or RECENT LIBRARY PATTERNS from this run. Never pull from Hindsight Memories or Canonical Pages.
             - MEMORY ISOLATION: HINDSIGHT_MEMORIES are for THE COMPASS (Opening Synthesis) ONLY. You are strictly forbidden from listing a memory as a bullet point in the task sections.
             - TONE: Match the PERSONA GUIDELINE. Be direct, simple, human. Talk like a friend who is also a high-level operator.
             - TONE GUARD: NEVER use words like 'Operational', 'Vanguard', 'Strategic Momentum', 'Audit', 'Battlefield', 'Chief of Staff', 'Tactical', 'Executive Office'. Use simple, punchy sentences. NEVER use: 'momentum', 'focus', 'gentle', 'reflection', 'push', 'strategic', 'SITREP', 'optimal', 'mission', 'ready for your review'.
             - INTELLIGENT FILTERING: 
-                - If mode is 🔴 Urgent: HIDE the 🏠 Home, ⛪ Church, and 💡 Ideas sections. Focus strictly on 🚀 Work and ✅ Done.
-                - If mode is 🟡 Important: Prioritize 🚀 Work and ⛪ Church.
+                - If mode is 🔴 Urgent: HIDE the 🏠 Home and 💡 Ideas sections. Focus strictly on 🚀 Work and ✅ Done.
+                - If mode is 🟡 Important: Prioritize 🚀 Work and other core sections.
                 - NIGHT MODE PRIORITIZATION (Intel: Vaulted):
-                    - 1. ✅ Done: List this first. Danny needs to see the loops he closed today to clear his mind.
-                    - 2. 🏠 Home: List this second. Prioritize family, pets, and chores to transition Danny into 'Dad' mode.
-                    - 3. ⛪ Church: List third. Ashraya church tasks.
-                    - 4. 🚀 Work: List only the top 2-3 most critical open loops for tomorrow. 
-                    - 5. 💡 Ideas: List any insights captured today to ensure they are 'secured' in the vault.
+                    - 1. ✅ Done: List this first. {_pctx['owner_name']} needs to see the loops closed today to clear their mind.
+                    - 2. 🏠 Home: List this second. Prioritize family, chores, and personal transitions.
+                    - 3. 🚀 Work: List only the top 2-3 most critical open loops for tomorrow. 
+                    - 4. 💡 Ideas: List any insights captured today to ensure they are 'secured' in the vault.
             - SECTION DENSITY: Max 3 items per section. If more exist, append: "...and X more in /library or /vault".
             - TASK SYNTAX: Every item must follow: "- [ICON] [Task Title]". No IDs, weights, or parentheses.
             - REVENUE BOLDING: Bold all tasks involving Sales, Pilots, or Payments using **task title**.
@@ -855,7 +875,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             - REVENUE IDENTIFICATION & FORMATTING:
             - If a NEW INPUT is "Revenue Critical" (involves payments, quotes, or high-ticket items like the ₹30L recovery), set is_revenue_critical: true in the new_tasks array.
             - Never apply this flag to completed tasks.
-             - For the briefing output, you MUST bold the titles of these specific tasks to ensure Danny sees them immediately.
+             - For the briefing output, you MUST bold the titles of these specific tasks to ensure {_pctx['owner_name']} sees them immediately.
                 - INBOX SECTION: If EMAIL-SUGGESTED TASKS has items, include a "📧 Inbox" section in the briefing listing each one. Format as: "- 📧 Task suggestion. Reply to confirm or ignore." Never auto-add these to newtasks.
                 - STALE TASKS: If STALE_TASKS has items, include a short ⏳ Stale Loops section listing them with day count. Max 5. Cap with '...and X more stalled' if over 5.
              
@@ -865,15 +885,15 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                 // Example ONLY: {{ "id": 123, "status": "done" }}, {{ "id": 456, "status": "todo", "reminder_at": "2026-03-20T10:00:00+05:30" }}, {{ "id": 789, "status": "todo", "reminder_at": "2026-03-21" }}
             ],
             "new_projects": [
-                // Example ONLY: {{ "name": "...", "importance": 8, "org_tag": "SOLVSTRAT" }}
+                // Example ONLY: {{ "name": "...", "importance": 8, "org_tag": "{_pctx['default_domain_tag']}" }}
             ],
             "new_people": [
                 // Example ONLY: {{ "name": "...", "role": "...", "strategic_weight": 9 }}
             ],
             "new_tasks": [
                 // Example ONLY: {{ "title": "...", "project_name": "...", "priority": "urgent", "estimated_duration": 15, "reminder_at": null }},
-                // Example ONLY: {{ "title": "...", "project_name": "Solvstrat", "priority": "important", "estimated_duration": 30, "reminder_at": "2026-03-21" }},
-                // Example ONLY: {{ "title": "...", "project_name": "Qhord", "priority": "urgent", "estimated_duration": 45, "reminder_at": "2026-03-21T10:00:00+05:30" }}
+                // Example ONLY: {{ "title": "...", "project_name": "Project A", "priority": "important", "estimated_duration": 30, "reminder_at": "2026-03-21" }},
+                // Example ONLY: {{ "title": "...", "project_name": "Project B", "priority": "urgent", "estimated_duration": 45, "reminder_at": "2026-03-21T10:00:00+05:30" }}
             ],
             "resources": [
                 // Example ONLY: {{ "url": "...", "title": "...", "summary": "...", "mission_name": "...", "project_name": "...", "strategic_note": "..." }}
@@ -888,8 +908,8 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         system_instruction_text = f"""{system_persona}
 
             MANDATE — SILENCE PROTOCOL & HALLUCINATION GUARD:
-            - PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', 'I'll send', or 'I'll handle it'. You do not have the power to contact people. Your only job is to confirm that Danny's task is SECURED in his system.
-            - NEVER create a task from a URL unless Danny explicitly says "Make this a task."
+            - PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', 'I'll send', or 'I'll handle it'. You do not have the power to contact people. Your only job is to confirm that {_pctx['owner_name']}'s task is SECURED in his system.
+            - NEVER create a task from a URL unless {_pctx['owner_name']} explicitly says "Make this a task."
             - NEVER proactively invent tasks or ideas. ONLY track what is manually entered or already exists.
             - If NEW INPUTS is "None" or empty, you MUST return completely empty arrays for `completed_task_ids`, `new_tasks`, `new_projects`, and `resources` [].
             - NEVER "make up", guess, or generate example tasks.
@@ -910,40 +930,23 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             2. If a task mentions a keyword, person, or topic from a project's description/keywords, use that project.
             3. Sub-projects (those marked "sub-project of X") are always more specific — prefer them.
             4. For new projects you don't recognise from the list:
-               - If it's client/tech work → use "Solvstrat" as the project_name.
-               - If it's Qhord-related → use "Qhord".
-                - If it's Ashraya church admin/operations → use "Ashraya".
-               - If it's family/home → use "Family & Home".
+               {_pctx['project_routing']}
                - NEVER use "Inbox" for business tasks.
 
             NEW PROJECT CREATION CRITERIA:
-            - SOLVSTRAT: Auto-create new projects for completely unknown client names mentioned (e.g., a company hiring Solvstrat for tech work). Set org_tag: "SOLVSTRAT", parent_project_name: "Solvstrat".
-            - OTHER DOMAINS (QHORD, ASHRAYA, PERSONAL, CRAYON): ONLY create a new project if Danny explicitly says "create a project", "start a new project", or gives a clear commanding instruction. Otherwise, route the work as a task under the existing parent project. Do NOT auto-create projects for one-off tasks or casual mentions.
+            - Auto-create new projects for completely unknown client names mentioned (e.g., a company hiring for work). Set org_tag from the matched domain.
+            - ONLY create a project if {_pctx['owner_name']} explicitly says "create a project", "start a new project", or gives a clear commanding instruction. Otherwise, route the work as a task under the existing parent project. Do NOT auto-create projects for one-off tasks or casual mentions.
             - Always populate "description" with a one-sentence summary of the project's purpose.
             - Always populate "keywords" with an array of relevant names, abbreviations, companies, and topics.
             - Always populate "context" using the rules below.
 
             ORG_TAG & CONTEXT ROUTING (MANDATORY — never leave as INBOX):
-            Danny's world has 5 domains. Route every new project into exactly one:
+            {_pctx['owner_name']}'s domains. Route every new project into exactly one:
 
-              CRAYON     | context: work     | Company umbrella. Governance, legal, tax, compliance, admin structure, company-level config, board matters. → Set org_tag: "CRAYON", parent_project_name: "Crayon"
+            {_pctx['domain_block']}
 
-              SOLVSTRAT  | context: work     | Client services and delivery. Software development, consulting, client projects, tech services. Clients include: Shield Identity, GRB, Equisoft, Armour Cyber, Johan. → Set org_tag: "SOLVSTRAT", parent_project_name: "Solvstrat"
-
-              QHORD      | context: work     | Danny's own product company (launching June 2026). Product development, GTM, marketing, beta, sales, everything Qhord. → Set org_tag: "QHORD", parent_project_name: "Qhord"
-
-              ASHRAYA    | context: personal | Ashraya church administration, operations, accounts, facility management, event coordination, organizational work. → Set org_tag: "ASHRAYA", parent_project_name: "Ashraya"
-
-              PERSONAL   | context: personal | Everything personal — family, home, kids, health, personal admin, hobbies, investments, learning, spiritual practices, journaling. Under "Family & Home" parent. → Set org_tag: "PERSONAL", parent_project_name: "Family & Home"
-
-              ROUTING RULES (apply in order):
-              1. Does the input mention Crayon governance, legal, tax, company structure? → CRAYON
-              2. Does the input mention Qhord product development, GTM, or launch? → QHORD
-              3. Does the input mention a client paying Solvstrat for tech/product work? → SOLVSTRAT
-              4. Does the input mention Ashraya church admin, operations, accounts? → ASHRAYA
-              5. Does the input mention family, home, kids, health, spiritual, learning, or personal admin? → PERSONAL
-              6. Default for anything business/work that doesn't fit 1-3: → SOLVSTRAT
-              7. NEVER default to INBOX for business or client work.
+            {_pctx['routing_rules']}
+            7. NEVER default to INBOX for business or client work.
             
             DRIFT DETECTION (Temporal Lineage):
             - Check if active projects have been updated 3+ times in 48 hours.
@@ -956,11 +959,11 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             - STRICT MISSION MATCHING: ONLY assign a `mission_id` if the resource is a direct "building block" for an ACTIVE MISSION. If it is just a "cool tool" or "interesting read," leave `mission_id` as NULL.
 
             STRATEGIC AUDIT INSTRUCTIONS:
-            - BLINDSPOT AUDIT: Evaluate every URL in NEW INPUTS against Danny's projects.
+            - BLINDSPOT AUDIT: Evaluate every URL in NEW INPUTS against {_pctx['owner_name']}'s projects.
             - CONNECTION MAPPING: If a resource mentions a person in the PEOPLE list, link them in the summary.
             - PATTERN DETECTION: If you see 3+ links on a new topic, you MAY suggest a new mission in the `new_missions` JSON array.
             - THE VAULT GATE: These updates go to the DATABASE only.
-            - THE BRIEFING GATE: You are STRICTLY FORBIDDEN from mentioning new resources or new missions in the briefing UNLESS Danny specifically used the word "Vault" or "Mission" in the NEW INPUTS.
+            - THE BRIEFING GATE: You are STRICTLY FORBIDDEN from mentioning new resources or new missions in the briefing UNLESS {_pctx['owner_name']} specifically used the word "Vault" or "Mission" in the NEW INPUTS.
 
             MISSION vs. INCUBATOR FRAMEWORK:
             - MISSION ASSEMBLY: Evaluate every URL and Input against ACTIVE MISSIONS. If a link provides a "component" for a mission, assign the "mission_name".
@@ -970,7 +973,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
 
             DYNAMIC TASK MATCHING:
             - Compare inputs against ALL SYSTEM TASKS.
-            - If Danny says "I'm done" or "Completed," mark the status as `done`.
+            - If {_pctx['owner_name']} says "I'm done" or "Completed," mark the status as `done`.
             - DURATION ASSIGNMENT: Assign `estimated_duration` based on task type:
             - 15 minutes for routine tasks (emails, quick replies, status updates)
             - 45 minutes for anything related to Pilots, Sales, or high-stakes Mission 10 items
@@ -985,10 +988,10 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             3. ANALYZE NEW INPUTS: Identify completions, new tasks, new people, and new projects.
             4. STRATEGIC NAG: If STAGNANT_URGENT_TASKS exists, start the brief by calling these out.
             5. STALE LOOPS: If STALE_TASKS exists, always include the ⏳ Stale Loops section — never suppress it regardless of mode.
-            6. CHECK FOR COMPLETION: Compare inputs against ALL SYSTEM TASKS to identify IDs finished by Danny.
+            6. CHECK FOR COMPLETION: Compare inputs against ALL SYSTEM TASKS to identify IDs finished by {_pctx['owner_name']}.
             6a. UPDATE DETECTION: If a user says "Update [title]" or "Reschedule [title]" or "Change [title] to [new time]", IMMEDIATELY search ALL SYSTEM TASKS for the matching task. Return it in completed_task_ids with the updated reminder_at and/or duration_mins — NOT in new_tasks.
-            7. HIGH-PRECISION TIME FORMATTING (IST/UTC+05:30): When Danny mentions a time, convert to ISO-8601. If DAY only (no time), output "YYYY-MM-DD". If EXACT TIME, output "YYYY-MM-DDTHH:MM:SS+05:30". NAKED TASKS: If NO date and NO time, return null for reminder_at.
-            8. AUTO-ONBOARDING: If a new Solvstrat client is mentioned, add to "new_projects" (org_tag: SOLVSTRAT). For other domains, only create a project if Danny explicitly commands it. If a new Person is mentioned, add to "new_people".
+            7. HIGH-PRECISION TIME FORMATTING (IST/UTC+05:30): When {_pctx['owner_name']} mentions a time, convert to ISO-8601. If DAY only (no time), output "YYYY-MM-DD". If EXACT TIME, output "YYYY-MM-DDTHH:MM:SS+05:30". NAKED TASKS: If NO date and NO time, return null for reminder_at.
+             8. AUTO-ONBOARDING: If a new client is mentioned, add to "new_projects" (org_tag: {_pctx['default_domain_tag']}). For other domains, only create a project if {_pctx['owner_name']} explicitly commands it. If a new Person is mentioned, add to "new_people".
             9. STRATEGIC WEIGHTING: Grade items (1-10) based on Cashflow Recovery (₹30L debt).
             10. WEEKEND FILTER: If isWeekend is true, do NOT suggest or list Work tasks in the briefing.
             """
@@ -1039,20 +1042,15 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
 
         # A. BATCH NEW PROJECTS (Deduplicated)
         if ai_data.get('new_projects'):
-            valid_tags = ['SOLVSTRAT', 'QHORD', 'PERSONAL', 'CRAYON', 'ASHRAYA']
-
-            CONTEXT_MAP = {
-                'ASHRAYA':   'personal',
-                'PERSONAL':  'personal',
-                'SOLVSTRAT': 'work',
-                'QHORD':     'work',
-                'CRAYON':    'work',
-            }
+            dom_config = _pctx.get('domains_config', [])
+            valid_tags_list = get_valid_tags(dom_config) or ['WORK']
+            context_map_dict = get_context_map(dom_config) or {}
+            default_tag = get_default_domain_tag(dom_config) or 'WORK'
             filtered_new_projects = []
 
             for new_p in ai_data['new_projects']:
                 p_name = new_p.get('name', 'Unnamed Project')
-                p_tag = new_p.get('org_tag', 'SOLVSTRAT')
+                p_tag = new_p.get('org_tag', default_tag)
                 already_exists = any(
                     p_name.lower() in get_project_name(existing_p).lower() or
                     get_project_name(existing_p).lower() in p_name.lower()
@@ -1069,9 +1067,9 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
 
                     filtered_new_projects.append({
                         "name": p_name,
-                        "org_tag": p_tag if p_tag in valid_tags else 'SOLVSTRAT',
+                        "org_tag": p_tag if p_tag in valid_tags_list else default_tag,
                         "status": "active",
-                        "context": CONTEXT_MAP.get(p_tag, 'work'),
+                        "context": context_map_dict.get(p_tag, 'work'),
                         "is_active": True,
                         "description": p_description,
                         "keywords": new_p.get('keywords', []),
@@ -1090,7 +1088,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                             print(f"🔗 Will link '{p_name}' → parent '{parent_match['name']}' (id: {resolved_parent_id})")
 
             if filtered_new_projects:
-                p_res = supabase.table('projects').insert(filtered_new_projects).execute()
+                p_res = user_query('projects').insert(filtered_new_projects).execute()
                 if p_res.data:
                     for new_proj in p_res.data:
                         project_name = new_proj.get('name')
@@ -1101,7 +1099,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                         }
                         try:
                             existing_node = (
-                                supabase.table('graph_nodes')
+                                user_query('graph_nodes')
                                 .select('id', 'type')
                                 .ilike('label', project_name)
                                 .maybe_single()
@@ -1109,18 +1107,18 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                             )
                             if existing_node and existing_node.data:
                                 if existing_node.data['type'] != 'project':
-                                    supabase.table('graph_nodes').update({
+                                    user_query('graph_nodes').update({
                                         'type': 'project',
                                         'metadata': node_metadata
                                     }).eq('id', existing_node.data['id']).execute()
                                     print(f"⬆️ Upgraded node '{project_name}' from {existing_node.data['type']} → project")
                                 else:
                                     audit_log_sync("pulse", "WARNING", f"⚠️ Project node '{project_name}' already exists, updating metadata.")
-                                    supabase.table('graph_nodes').update({
+                                    user_query('graph_nodes').update({
                                         'metadata': node_metadata
                                     }).eq('id', existing_node.data['id']).execute()
                             else:
-                                supabase.table('graph_nodes').insert({
+                                user_insert('graph_nodes', {
                                     "label": project_name,
                                     "type": "project",
                                     "metadata": node_metadata
@@ -1133,10 +1131,10 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
 
         # B. BATCH NEW PEOPLE
         if ai_data.get('new_people'):
-            existing_people_res = supabase.table('people').select('name').execute()
+            existing_people_res = user_query('people').select('name').execute()
             existing_raw = {p['name'].lower().strip() for p in (existing_people_res.data or [])}
             existing_norm = {normalize_person_name(p['name']) for p in (existing_people_res.data or []) if normalize_person_name(p['name'])}
-            existing_nodes_res = supabase.table('graph_nodes').select('label, type').execute()
+            existing_nodes_res = user_query('graph_nodes').select('label, type').execute()
             existing_non_person_nodes = set()
             for gn in (existing_nodes_res.data or []):
                 if gn.get('type') != 'person':
@@ -1158,7 +1156,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                     continue
                 deduped_people.append({**p, "source": "pulse"})
             if deduped_people:
-                supabase.table('people').insert(deduped_people).execute()
+                user_query('people').insert(deduped_people).execute()
 
         # C. BATCH TASK UPDATES (The Smart Rescheduler)
         if ai_data.get('completed_task_ids'):
@@ -1175,7 +1173,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                 new_reminder = format_rfc3339(raw_reminder) if raw_reminder else None
                 
                 # 1. Fetch current IDs AND Status
-                task_ref = supabase.table('tasks').select('status', 'google_task_id', 'google_event_id', 'title').eq('id', target_id).single().execute()
+                task_ref = user_query('tasks').select('status', 'google_task_id', 'google_event_id', 'title').eq('id', target_id).single().execute()
 
                 # 🛡️ GUARD: Safely extract data - check BEFORE calling .get()
                 task_data = task_ref.data if task_ref.data else {}
@@ -1250,7 +1248,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                     proj_name = None
                     proj_id = task_data.get('project_id')
                     if proj_id:
-                        proj_lookup = supabase.table('projects').select('name').eq('id', proj_id).maybe_single().execute()
+                        proj_lookup = user_query('projects').select('name').eq('id', proj_id).maybe_single().execute()
                         proj_name = proj_lookup.data['name'] if proj_lookup.data else None
                     await write_outcome_memory(task_title, proj_name)
 
@@ -1356,13 +1354,14 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                             work_hints = ['client', 'nda', 'pilot', 'send', 'check', 'follow', 'call', 'meeting', 'project']
                             is_work_context = any(hint in ai_target.lower() for hint in work_hints)
                             if is_work_context:
-                                solvstrat_fallback = next(
-                                    (p for p in legacy_projects if p.get('org_tag') == 'SOLVSTRAT' and not p.get('parent_project_id')),
+                                default_domain = get_default_domain_tag(_pctx.get('domains_config', [])) or 'WORK'
+                                default_fallback = next(
+                                    (p for p in legacy_projects if p.get('org_tag') == default_domain and not p.get('parent_project_id')),
                                     None
                                 )
-                                if solvstrat_fallback:
-                                    task_project_id = solvstrat_fallback['id']
-                                    audit_log_sync("pulse", "WARNING", f"⚠️ Task '{task.get('title')}' fell back to Solvstrat (no match for '{ai_target}')")
+                                if default_fallback:
+                                    task_project_id = default_fallback['id']
+                                    audit_log_sync("pulse", "WARNING", f"⚠️ Task '{task.get('title')}' fell back to {default_domain} (no match for '{ai_target}')")
                             else:
                                 error_log.append(f"Task routing failed for: '{task.get('title')}'")
 
@@ -1387,7 +1386,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                 dedup_key = hashlib.md5(
                     f"{task_title.lower().strip()}:{task_project_id}".encode()
                 ).hexdigest()[:16]
-                existing = supabase.table('tasks').select('id') \
+                existing = user_query('tasks').select('id') \
                     .eq('dedup_key', dedup_key) \
                     .not_.in_('status', ['done', 'cancelled']) \
                     .limit(1).execute()
@@ -1408,7 +1407,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                 })
                 explicit_times.append(explicit_time)
             if task_inserts:
-                insert_res = supabase.table('tasks').insert(task_inserts).execute()
+                insert_res = user_query('tasks').insert(task_inserts).execute()
                 print(f"✅ Phase 1: Inserted {len(insert_res.data)} new tasks to Supabase.")
 
                 # PHASE 2: Side-Effect Orchestration - Google Sync after DB success
@@ -1470,7 +1469,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                     # 2c. Store Google IDs back to Supabase (direct update, no version churn)
                     if g_id or e_id:
                         try:
-                            supabase.table('tasks').update({
+                            user_query('tasks').update({
                                 'google_task_id': g_id,
                                 'google_event_id': e_id,
                             }).eq('id', task_id).execute()
@@ -1480,14 +1479,14 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
 
         # G. CLEANUP & LOGS
         if ai_data.get('logs'):
-            supabase.table('logs').insert(ai_data['logs']).execute()
+            get_supabase().table('logs').insert(ai_data['logs']).execute()
 
         # H. NEW MISSIONS
         missions_created_count = 0
         if ai_data.get('new_missions'):
             # TITLE A0. BATCH NEW MISSIONS Deduplicated...
             # Fetch existing mission titles for deduplication
-            existing_missions_res = supabase.table('missions').select('id, title').eq('status', 'active').execute()
+            existing_missions_res = user_query('missions').select('id, title').eq('status', 'active').execute()
             existing_titles_normalized = {normalize_mission_title(m['title']): m for m in (existing_missions_res.data or [])}
             run_dedup = set()
 
@@ -1503,7 +1502,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                 # Insert new mission
                 ist_ts = datetime.now(timezone(timedelta(hours=5, minutes=30)))
                 description = f"Auto-created by Pulse from recurring resource/input patterns on {ist_ts.strftime('%Y-%m-%d')}."
-                insert_res = supabase.table('missions').insert({
+                insert_res = user_insert('missions', {
                     "title": mission_title.strip(),
                     "status": "active",
                     "description": description
@@ -1523,7 +1522,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         if active_missions:
             try:
                 # Fetch resources with NULL mission_id that have metadata to classify
-                null_resources_res = supabase.table('resources').select(
+                null_resources_res = user_query('resources').select(
                     'id, url, title, summary, strategic_note, category'
                 ).is_('mission_id', None).execute()
                 null_resources = null_resources_res.data or []
@@ -1610,7 +1609,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         if briefing_text:
             # 🛡️ THE ARCHITECT'S FINAL REPAIR: Force double newlines before all section headers
             # This ensures that even if the AI 'whispers', the grid stays intact.
-            headers = ['🚀 Work', '🏠 Home', '⛪ Church', '💡 Ideas', '✅ Done', '🛡️ WEEKEND RECON']
+            headers = ['🚀 Work', '🏠 Home', '💡 Ideas', '✅ Done', '🛡️ WEEKEND RECON']
             for header in headers:
                 if header in briefing_text:
                     # Replace the header with a version that has breathing room above it
@@ -1633,15 +1632,15 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
             try:
                 # Auto-expire tasks older than 7 days
                 cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-                supabase.table('email_pending_tasks')\
-                    .update({'danny_decision': 'expired'})\
-                    .is_('danny_decision', 'null')\
+                user_query('email_pending_tasks')\
+                    .update({'user_decision': 'expired'})\
+                    .is_('user_decision', 'null')\
                     .lt('created_at', cutoff)\
                     .execute()
 
-                pending_decisions = supabase.table('email_pending_tasks')\
+                pending_decisions = user_query('email_pending_tasks')\
                     .select('id, suggested_title, suggested_project, created_at')\
-                    .is_('danny_decision', 'null')\
+                    .is_('user_decision', 'null')\
                     .order('created_at', desc=False)\
                     .limit(5)\
                     .execute()
@@ -1698,7 +1697,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
         # Log Pulse briefing to raw_dumps so it appears in web UI
         if send_success and briefing_text:
             try:
-                supabase.table('raw_dumps').insert([{
+                user_insert('raw_dumps', {
                     "content": briefing_text,
                     "status": "completed",
                     "is_processed": True,
@@ -1706,14 +1705,14 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
                     "sender": "system",
                     "message_type": "briefing",
                     "metadata": {"source": "pulse", "hour": hour}
-                }]).execute()
+                }).execute()
             except Exception as log_err:
                 audit_log_sync("pulse", "WARNING", f"Failed to log briefing to raw_dumps: {log_err}")
 
         # Mark shown_in_brief only AFTER confirmed Telegram send
         if send_success and shown_ids:
             try:
-                supabase.table('email_pending_tasks')\
+                user_query('email_pending_tasks')\
                     .update({'shown_in_brief': True})\
                     .in_('id', shown_ids)\
                     .execute()
@@ -1728,13 +1727,13 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
 
         # ✅ COMPLETION DUMP CLOSER — seal the raw dumps that were completion signals
         if completion_dump_ids:
-            supabase.table('raw_dumps').update({"status": "completed", "is_processed": True}).in_('id', completion_dump_ids).execute()
+            user_query('raw_dumps').update({"status": "completed", "is_processed": True}).in_('id', completion_dump_ids).execute()
             print(f"✅ Sealed {len(completion_dump_ids)} completion dumps.")
 
         # --- PHASE 3: Processed Gate ---
         if dumps:
             dump_ids = [d['id'] for d in dumps]
-            supabase.table('raw_dumps').update({
+            user_query('raw_dumps').update({
                 "status": "completed",
                 "is_processed": True 
             }).in_('id', dump_ids).execute()
@@ -1742,7 +1741,7 @@ async def process_pulse(auth_secret: str = None, request_id: str = None):
 
         if synced_dumps:
             synced_ids = [d['id'] for d in synced_dumps]
-            supabase.table('raw_dumps').update({
+            user_query('raw_dumps').update({
                 "status": "completed",
                 "is_processed": True
             }).in_('id', synced_ids).execute()

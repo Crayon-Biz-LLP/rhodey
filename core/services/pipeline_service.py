@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timezone, timedelta
-from core.services.db import get_supabase
+from core.services.db import get_supabase, user_query, user_insert
 from core.lib.audit_logger import audit_log_sync
 
 
@@ -10,7 +10,7 @@ async def check_pipeline_health() -> str:
     try:
         two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
 
-        stuck_res = supabase.table('raw_dumps') \
+        stuck_res = user_query('raw_dumps') \
             .select('id', count='exact') \
             .in_('status', ['pending', 'staged']) \
             .lt('created_at', two_hours_ago) \
@@ -20,7 +20,7 @@ async def check_pipeline_health() -> str:
             lines.append(f"{stuck_count} raw_dumps stuck in 'pending'/'staged' > 2h")
 
         ten_mins_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        processing_res = supabase.table('raw_dumps') \
+        processing_res = user_query('raw_dumps') \
             .select('id', count='exact') \
             .eq('status', 'processing') \
             .lt('created_at', ten_mins_ago) \
@@ -44,7 +44,7 @@ async def check_pipeline_health() -> str:
                 audit_log_sync("pipeline_service", "WARNING", f"Failed to send Telegram alert: {alert_e}")
 
         seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        null_emb_res = supabase.table('memories') \
+        null_emb_res = user_query('memories') \
             .select('id', count='exact') \
             .is_('embedding', 'null') \
             .gte('created_at', seven_days_ago) \

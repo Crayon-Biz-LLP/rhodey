@@ -2,14 +2,9 @@ import os
 import json
 import asyncio
 from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
 from core.lib.audit_logger import audit_log_sync
 from core.pulse.llm import get_embedding, cosine_similarity
-
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
+from core.services.db import get_supabase, user_query, user_insert
 
 
 async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: int = None, task_description: str = None, people_cache=None):
@@ -18,7 +13,7 @@ async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: 
     Non-blocking. If this fails, the task is already saved — no rollback needed.
     """
     try:
-        task_node = supabase.table('graph_nodes') \
+        task_node = user_query('graph_nodes') \
             .select('id') \
             .eq('type', 'task') \
             .filter('metadata->>task_id', 'eq', str(task_id)) \
@@ -28,7 +23,7 @@ async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: 
         if task_node and task_node.data:
             task_node_id = task_node.data['id']
         else:
-            new_node = supabase.table('graph_nodes').insert({
+            new_node = user_insert('graph_nodes', {
                 "label": task_title,
                 "type": "task",
                 "metadata": {
@@ -40,7 +35,7 @@ async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: 
             task_node_id = new_node.data[0]['id']
 
         if project_id:
-            proj_node = supabase.table('graph_nodes') \
+            proj_node = user_query('graph_nodes') \
                 .select('id') \
                 .eq('type', 'project') \
                 .filter('metadata->>project_id', 'eq', str(project_id)) \
@@ -48,7 +43,7 @@ async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: 
                 .execute()
 
             if proj_node and proj_node.data:
-                existing = supabase.table('graph_edges') \
+                existing = user_query('graph_edges') \
                     .select('id') \
                     .eq('source_node_id', task_node_id) \
                     .eq('target_node_id', proj_node.data['id']) \
@@ -57,7 +52,7 @@ async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: 
                     .execute()
 
                 if not existing or not existing.data:
-                    supabase.table('graph_edges').insert({
+                    user_insert('graph_edges', {
                         "source_node_id": task_node_id,
                         "target_node_id": proj_node.data['id'],
                         "relationship": "BELONGS_TO",
@@ -71,11 +66,11 @@ async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: 
         if people_cache is not None:
             all_people = people_cache
         else:
-            all_people = supabase.table('people').select('id, name').execute().data or []
+            all_people = user_query('people').select('id, name').execute().data or []
 
         for person in (all_people or []):
             if person['name'].lower() in search_text:
-                person_node = supabase.table('graph_nodes') \
+                person_node = user_query('graph_nodes') \
                     .select('id') \
                     .eq('type', 'person') \
                     .filter('metadata->>people_id', 'eq', str(person['id'])) \
@@ -83,7 +78,7 @@ async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: 
                     .execute()
 
                 if person_node and person_node.data:
-                    existing_edge = supabase.table('graph_edges') \
+                    existing_edge = user_query('graph_edges') \
                         .select('id') \
                         .eq('source_node_id', task_node_id) \
                         .eq('target_node_id', person_node.data['id']) \
@@ -92,7 +87,7 @@ async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: 
                         .execute()
 
                     if not existing_edge or not existing_edge.data:
-                        supabase.table('graph_edges').insert({
+                        user_insert('graph_edges', {
                             "source_node_id": task_node_id,
                             "target_node_id": person_node.data['id'],
                             "relationship": "INVOLVES",
@@ -112,14 +107,14 @@ async def write_graph_edges_for_task(task_id: int, task_title: str, project_id: 
 async def hybrid_search_graph(query: str) -> str:
     """Graph-first search: Find primary entity and its connections."""
     try:
-        nodes_res = supabase.table('graph_nodes').select('id, label').ilike('label', f'%{query}%').limit(1).execute()
+        nodes_res = user_query('graph_nodes').select('id, label').ilike('label', f'%{query}%').limit(1).execute()
 
         # TODO: If match_graph_nodes RPC does not exist yet in Supabase,
         # create it mirroring the match_memories pattern for graph_nodes table.
         if not nodes_res.data:
             try:
                 query_embedding = await asyncio.to_thread(get_embedding, query)
-                vector_res = supabase.rpc('match_graph_nodes', {
+                vector_res = get_supabase().rpc('match_graph_nodes', {
                     'query_embedding': query_embedding,
                     'match_count': 1,
                     'match_threshold': 0.65
@@ -135,7 +130,7 @@ async def hybrid_search_graph(query: str) -> str:
         primary_node = nodes_res.data[0]
         primary_id = primary_node['id']
 
-        edges_res = supabase.table('graph_edges').select('source_node_id, target_node_id, relationship').or_(f'source_node_id.eq.{primary_id},target_node_id.eq.{primary_id}').execute()
+        edges_res = user_query('graph_edges').select('source_node_id, target_node_id, relationship').or_(f'source_node_id.eq.{primary_id},target_node_id.eq.{primary_id}').execute()
 
         if not edges_res.data:
             return ""
@@ -149,7 +144,7 @@ async def hybrid_search_graph(query: str) -> str:
                 connected_ids.add(edge['source_node_id'])
 
         if connected_ids:
-            labels_res = supabase.table('graph_nodes').select('id, label').in_('id', list(connected_ids)).execute()
+            labels_res = user_query('graph_nodes').select('id, label').in_('id', list(connected_ids)).execute()
             if not labels_res.data:
                 return ""
             label_map = {str(n['id']): n['label'] for n in labels_res.data}
@@ -192,7 +187,7 @@ async def check_task_dependencies(active_tasks: list) -> str:
             task_title = task.get('title', '')
 
             # Get the graph node for this task
-            task_node_res = supabase.table('graph_nodes') \
+            task_node_res = user_query('graph_nodes') \
                 .select('id') \
                 .eq('type', 'task') \
                 .filter('metadata->>task_id', 'eq', str(task_id)) \
@@ -205,7 +200,7 @@ async def check_task_dependencies(active_tasks: list) -> str:
             task_node_id = task_node_res.data['id']
 
             # Find edges where this task DEPENDS_ON another task
-            dep_edges = supabase.table('graph_edges') \
+            dep_edges = user_query('graph_edges') \
                 .select('source_node_id, target_node_id, relationship, metadata') \
                 .eq('source_node_id', task_node_id) \
                 .execute()
@@ -217,7 +212,7 @@ async def check_task_dependencies(active_tasks: list) -> str:
                     target_id = edge.get('target_node_id')
 
                     # Find the target node's task_id from metadata
-                    target_node_res = supabase.table('graph_nodes') \
+                    target_node_res = user_query('graph_nodes') \
                         .select('id, label, metadata') \
                         .eq('id', target_id) \
                         .maybe_single() \
@@ -276,7 +271,7 @@ async def analyze_communication_patterns(people: list) -> str:
                 continue
 
             # Get person node
-            person_node_res = supabase.table('graph_nodes') \
+            person_node_res = user_query('graph_nodes') \
                 .select('id') \
                 .eq('type', 'person') \
                 .filter('metadata->>people_id', 'eq', str(person_id)) \
@@ -289,7 +284,7 @@ async def analyze_communication_patterns(people: list) -> str:
             person_node_id = person_node_res.data['id']
 
             # Count INVOLVES edges (task involvements)
-            involves_edges = supabase.table('graph_edges') \
+            involves_edges = user_query('graph_edges') \
                 .select('source_node_id, target_node_id') \
                 .eq('relationship', 'INVOLVES') \
                 .or_(f'source_node_id.eq.{person_node_id},target_node_id.eq.{person_node_id}') \
@@ -300,7 +295,7 @@ async def analyze_communication_patterns(people: list) -> str:
             # Get recent email count for this person
             email_count = 0
             try:
-                email_res = supabase.table('emails') \
+                email_res = user_query('emails') \
                     .select('id', count='exact') \
                     .or_(f'sender.ilike.%{person_name}%,linked_person_id.eq.{person_id}') \
                     .execute()
@@ -370,7 +365,7 @@ async def fetch_graph_task_context(people: list, active_tasks: list) -> str:
 
         # Get all person nodes
         people_ids = {p['id']: p['name'] for p in people}
-        person_nodes = supabase.table('graph_nodes') \
+        person_nodes = user_query('graph_nodes') \
             .select('id, label, metadata') \
             .eq('type', 'person') \
             .execute()
@@ -389,7 +384,7 @@ async def fetch_graph_task_context(people: list, active_tasks: list) -> str:
                 node_to_person[node['id']] = people_ids[int(people_id)]
 
         # Find INVOLVES edges linking person nodes to task nodes
-        task_nodes = supabase.table('graph_nodes') \
+        task_nodes = user_query('graph_nodes') \
             .select('id, metadata') \
             .eq('type', 'task') \
             .execute()
@@ -412,7 +407,7 @@ async def fetch_graph_task_context(people: list, active_tasks: list) -> str:
             return ""
 
         # Get INVOLVES edges
-        edges_res = supabase.table('graph_edges') \
+        edges_res = user_query('graph_edges') \
             .select('source_node_id, target_node_id, relationship') \
             .in_('relationship', ['INVOLVES', 'MANAGES', 'ASSIGNED_TO']) \
             .execute()

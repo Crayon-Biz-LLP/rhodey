@@ -2,17 +2,22 @@ import os
 import json
 import re
 from datetime import datetime, timezone, timedelta
-from google import genai
-from supabase import create_client, Client
 from core.lib.audit_logger import audit_log_sync
 from core.webhook.telegram import send_telegram
 from core.webhook.classify import call_gemini_with_retry, CLASSIFICATION_MODEL
+from core.services.db import user_query, user_insert, get_supabase
+from core.lib.prompt_template import render_prompt
 
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
+
+_gemini_client = None
+
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
+        _gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    return _gemini_client
 
 
 async def process_multimodal_content(file_bytes: bytes, mime_type: str, chat_id: int, ist_hour: int = None, core_json: str = "[]"):
@@ -28,15 +33,15 @@ async def process_multimodal_content(file_bytes: bytes, mime_type: str, chat_id:
     else:
         time_phase = "night"
 
-    prompt = f"""You are Danny's Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to Danny's vision. You don't coach or 'motivate.' Speak simply and punchy. If it's after 9 PM, append a dry command to sign off (e.g., 'Go be a dad').
+    prompt = render_prompt(f"""You are {{owner_name}}'s Rhodey. Pragmatic, loyal, and a professional friend. You are the grounding wire to {{owner_name}}'s vision. You don't coach or 'motivate.' Speak simply and punchy. If it's after 9 PM, append a dry command to sign off (e.g., 'Go be a dad').
 
-    PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm Danny's task is SECURED in his system.
+    PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm {{owner_name}}'s task is SECURED in his system.
 
     CURRENT TIME CONTEXT: It's the {time_phase}.
 
     IDENTITY & BUSINESS CONTEXT: {core_json}
 
-    THE STRATEGIC MAP: PROJECT ROUTING: Route tasks about personal finances, bills, home, or family to PERSONAL. Only route to CRAYON if the task specifically relates to corporate governance, business taxes, or legal compliance. Route tech/client work to SOLVSTRAT. Default to INBOX.
+    THE STRATEGIC MAP: PROJECT ROUTING: {{project_routing}} Route to {{company_name}} only for company governance, legal, or tax matters. Default to INBOX.
 
     ---
     MULTIMODAL INSTRUCTIONS:
@@ -49,20 +54,20 @@ async def process_multimodal_content(file_bytes: bytes, mime_type: str, chat_id:
     - NOTE: Strategic insights, facts, or observations worth remembering.
     - DELEGATE: Research requests, competitor audits, or dossier building.
     - RECEIPT RULE: Receipts must be confirmation-only. Use: '[Subject] logged for [Time/Day].'
-    - LITERAL SUBJECT RULE: Mirror Danny's verb. (e.g., 'Check with Vasanth' → 'Vasanth check-in logged').
+    - LITERAL SUBJECT RULE: Mirror {{owner_name}}'s verb. (e.g., 'Check with Vasanth' → 'Vasanth check-in logged').
     - ZERO DATA LOSS: Never drop qualifiers like 'Canadian project' or 'Zoho API'.
-    - STEALTH ROUTING: Assign the entity in the JSON, but NEVER mention it (SOLVSTRAT, PERSONAL) in the receipt text.
+    - STEALTH ROUTING: {{stealth_routing}}
     - DATE HANDSHAKE: If a time or day is mentioned, include it in the receipt for verification.
     - If it's night (Phase: night), confirm the entry first, THEN give the sign-off command. (e.g., 'Vasanth check-in logged. Now go be a dad.').
     - TONE GUARD: NEVER use: 'momentum', 'focus', 'gentle', 'reflection', 'push', 'strategic', 'SITREP', 'optimal', 'mission', 'ready for your review'.
-    - PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm Danny's task is SECURED in his system.
+    - PROHIBIT ACTION HALLUCINATION: You are a logging tool, not an agent. NEVER say 'I'll ping', 'I'll check', or 'I'll handle it'. You cannot contact people. Your only job is to confirm {{owner_name}}'s task is SECURED in his system.
 
     OUTPUT:
-    Return ONLY a valid JSON array of objects. For every item, identify the 'entity' (QHORD, SOLVSTRAT, etc.).
-    Example: [{{"type": "TASK", "entity": "CRAYON", "content": "Send experience letters to Siva and Suriya by tomorrow"}}]
+    Return ONLY a valid JSON array of objects. For every item, identify the 'entity' ({{entity_list}}, etc.).
+    Example: [{{"type": "TASK", "entity": "{{company_name}}", "content": "Send experience letters to Siva and Suriya by tomorrow"}}]
 
     Tone: No corporate polish. No "Starship" metaphors. Talk like a high-level partner who knows the time of day and what's at stake.
-    """
+    """)
 
     try:
         content_parts = [prompt]
@@ -95,7 +100,7 @@ async def process_multimodal_content(file_bytes: bytes, mime_type: str, chat_id:
                 continue
 
             if item_type == 'TASK':
-                supabase.table('raw_dumps').insert([{
+                user_insert('raw_dumps', {
                     "content": content,
                     "status": "pending",
                     "direction": "incoming",
@@ -107,12 +112,12 @@ async def process_multimodal_content(file_bytes: bytes, mime_type: str, chat_id:
                         "mime_type": mime_type,
                         "entity": item.get('entity')
                     }
-                }]).execute()
+                }).execute()
                 task_count += 1
                 print(f"📋 Task extracted: {content[:50]}...")
 
             elif item_type == 'NOTE':
-                supabase.table('raw_dumps').insert([{
+                user_insert('raw_dumps', {
                     "content": content,
                     "status": "pending",
                     "direction": "incoming",
@@ -125,12 +130,12 @@ async def process_multimodal_content(file_bytes: bytes, mime_type: str, chat_id:
                         "mime_type": mime_type,
                         "entity": item.get('entity')
                     }
-                }]).execute()
+                }).execute()
                 note_count += 1
                 print(f"📝 Note staged: {content[:50]}...")
 
             elif item_type == 'DELEGATE':
-                supabase.table('agent_queue').insert({
+                user_insert('agent_queue', {
                     "query": content,
                     "status": "pending",
                     "metadata": {"source": "multimodal", "mime_type": mime_type}
