@@ -29,7 +29,7 @@ from core.services.onboarding import (
 from core.lib.auth import require_auth, get_current_user
 from core.lib.domain_utils import DEFAULT_DOMAINS
 
-app = FastAPI(title="Integrated-OS")
+app = FastAPI(title="Rhodey")
 
 
 # ==================== AUTH & ONBOARDING ====================
@@ -143,7 +143,7 @@ app.add_middleware(
 
 @app.get("/")
 def health_check():
-    return {"status": "Integrated OS API is running on Python 🐍"}
+    return {"status": "Rhodey API is running on Python 🐍"}
 
 # --- TELEGRAM INTAKE (Routes to webhook.py) ---
 @app.post("/api/webhook")

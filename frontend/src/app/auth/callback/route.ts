@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://integrated-os.vercel.app';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://rhodey-three.vercel.app';
 
 export async function GET(request: Request) {
   const url = new URL(request.url);

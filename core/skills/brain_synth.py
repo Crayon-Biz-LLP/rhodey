@@ -4,21 +4,33 @@ import os
 import httpx
 from datetime import datetime, timezone
 
-from core.services.db import user_query, user_insert, get_supabase, get_embedding
+from core.services.db import user_query, user_insert, get_supabase, get_embedding, get_current_user_id
 from core.services.llm import call_gemini_with_retry
 from core.lib.prompt_template import render_prompt
+from core.lib.domain_utils import DEFAULT_DOMAINS
 
-PARENT_ORG_TAGS = {'SOLVSTRAT', 'QHORD', 'ASHRAYA', 'PERSONAL', 'CRAYON'}
 SKIP_ORG_TAGS = {None, 'INBOX'}
 MIN_FRAGMENT_THRESHOLD = 5
 
-ORG_TAG_CONTEXT = {
-    'SOLVSTRAT': 'Client services and delivery. Software development, consulting, client projects.',
-    'QHORD': "Product GTM and launch. Qhord is {owner_name}'s standalone product launching June 2026.",
-    'ASHRAYA': 'Ashraya church administration, operations, finances, events.',
-    'PERSONAL': 'Family, home, health, personal admin, spiritual practices.',
-    'CRAYON': 'Company governance, legal, tax, compliance, admin structure.',
-}
+
+def _get_domain_config():
+    user_id = get_current_user_id()
+    if not user_id:
+        return DEFAULT_DOMAINS
+    profile = get_supabase().table('user_profiles').select('domains_config').eq('user_id', user_id).maybe_single().execute()
+    if profile.data and profile.data.get('domains_config'):
+        return profile.data['domains_config']
+    return DEFAULT_DOMAINS
+
+
+def _get_parent_org_tags():
+    config = _get_domain_config()
+    return {d['tag'] for d in config}
+
+
+def _get_org_tag_context():
+    config = _get_domain_config()
+    return {d['tag']: d.get('description', d['tag']) for d in config}
 
 
 def filter_fragments_by_project(results, project_name):
@@ -118,7 +130,7 @@ async def run_batch_sweep():
                     for p in people.data:
                         add_fragment("PERSON", f"{p.get('name', 'Unknown')} — {p.get('role', 'Unknown role')}")
 
-                if org_tag in PARENT_ORG_TAGS:
+                if org_tag in _get_parent_org_tags():
                     child_res = user_query('projects') \
                         .select('id, name') \
                         .eq('parent_project_id', project_id) \
@@ -134,7 +146,7 @@ async def run_batch_sweep():
                 print(f"Skipping {entity_name} — failed to fetch fragments: {e}")
                 continue
 
-            is_parent = org_tag in PARENT_ORG_TAGS and entity_name.lower() == org_tag.lower()
+            is_parent = org_tag in _get_parent_org_tags() and entity_name.lower() == org_tag.lower()
 
             existing = get_supabase().table('canonical_pages') \
                 .select('id, content') \
@@ -184,7 +196,7 @@ async def run_batch_sweep():
 
             org_tag = entry.get('org_tag', '')
             is_parent = entry.get('is_parent', False)
-            org_context = ORG_TAG_CONTEXT.get(org_tag, org_tag)
+            org_context = _get_org_tag_context().get(org_tag, org_tag)
 
             if is_parent:
                 prompt_role = "Executive Summary Writer for {owner_name}'s OS"

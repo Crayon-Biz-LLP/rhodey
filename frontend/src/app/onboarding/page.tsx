@@ -6,7 +6,7 @@ import { createClient } from '@/lib/supabase';
 import { Button } from '@/components/ui/button';
 import { Plus, Trash2, Star } from 'lucide-react';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://integrated-os.vercel.app';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://rhodey-three.vercel.app';
 
 async function apiPost(path: string, body: any) {
   const supabase = createClient();

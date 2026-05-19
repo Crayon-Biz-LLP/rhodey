@@ -84,8 +84,14 @@ async def trigger_github_pulse() -> bool:
             print("ERROR: GITHUB_TOKEN not set")
             return False
 
-        owner = os.getenv("GITHUB_OWNER", "Crayon-Biz-LLP")
-        repo = os.getenv("GITHUB_REPO", "integrated-os")
+        owner = os.getenv("GITHUB_OWNER")
+        if not owner:
+            print("ERROR: GITHUB_OWNER not set")
+            return False
+        repo = os.getenv("GITHUB_REPO")
+        if not repo:
+            print("ERROR: GITHUB_REPO not set")
+            return False
 
         url = f"https://api.github.com/repos/{owner}/{repo}/dispatches"
 
